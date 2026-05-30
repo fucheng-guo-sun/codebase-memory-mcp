@@ -1,9 +1,10 @@
 # TEMPORARY reproduction harness for bucket-B crash reports:
 #   #336 — segfault indexing Icinga2 (C++) on Linux (fast mode)
 #   #385 — crash indexing KiCad (C++) on Windows (moderate mode)
-# Builds the current-main binaries via _build.yml, then clones each repo and
-# indexes it on the originally-reported platform. A segfault/abort makes the
-# index step exit non-zero and fail the job. DELETE this workflow after the run.
+# Each job builds the current-main binary inline (no cross-platform coupling)
+# then clones the repo and indexes it on the originally-reported platform.
+# A segfault/abort makes the index step exit non-zero and fail the job.
+# DELETE this workflow after the run.
 name: Repro Bucket B (temp)
 
 on:
@@ -13,45 +14,50 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    uses: ./.github/workflows/_build.yml
-
   icinga2-linux:
-    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install deps (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          name: binaries-linux-amd64
-      - name: Extract binary
-        run: |
-          tar -xzf codebase-memory-mcp-linux-amd64.tar.gz
-          chmod +x codebase-memory-mcp
-          ./codebase-memory-mcp --version
+          node-version: "22"
+      - name: Build binary
+        run: scripts/build.sh
       - name: Clone Icinga2 (issue #336)
         run: git clone --depth 1 -b v2.16.0 https://github.com/Icinga/icinga2 icinga2-repro
       - name: Index Icinga2 fast — must not segfault
         run: |
           set -o pipefail
-          ./codebase-memory-mcp cli index_repository '{"repo_path":"icinga2-repro","mode":"fast"}' 2>&1 | tail -40
+          build/c/codebase-memory-mcp cli index_repository '{"repo_path":"icinga2-repro","mode":"fast"}' 2>&1 | tail -40
 
   kicad-windows:
-    needs: build
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c # v2
         with:
-          name: binaries-windows-amd64
-      - name: Extract binary
-        shell: bash
-        run: |
-          unzip -o codebase-memory-mcp-windows-amd64.zip
-          ./codebase-memory-mcp.exe --version
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            make
+            zip
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+      - name: Build binary
+        shell: msys2 {0}
+        run: scripts/build.sh CC=clang CXX=clang++
       - name: Clone KiCad (issue #385)
-        shell: bash
+        shell: msys2 {0}
         run: git clone --depth 1 https://gitlab.com/kicad/code/kicad kicad-repro
       - name: Index KiCad moderate — must not crash
-        shell: bash
+        shell: msys2 {0}
         run: |
           set -o pipefail
-          ./codebase-memory-mcp.exe cli index_repository '{"repo_path":"kicad-repro","mode":"moderate","persistence":true}' 2>&1 | tail -40
+          build/c/codebase-memory-mcp.exe cli index_repository '{"repo_path":"kicad-repro","mode":"moderate","persistence":true}' 2>&1 | tail -40
