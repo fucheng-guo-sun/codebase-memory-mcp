@@ -581,6 +581,24 @@ TEST(clsp_nocrash_template_function_multi_param_nested_call) {
     PASS();
 }
 
+/* Issue #312: indexing segfaulted in pass=definitions on a function template
+ * with a defaulted type param AND an `auto` parameter, called with matching
+ * arg count. The defaulted/unbound template param `U` flowed through type
+ * substitution as NULL and was dereferenced during return-type handling. */
+TEST(clsp_nocrash_issue312_default_template_auto_param) {
+    CBMFileResult *r = extract_cpp("template<typename T, typename U = int>\n"
+                                   "U f(auto, T t) {\n"
+                                   "    return t;\n"
+                                   "}\n"
+                                   "\n"
+                                   "int main() {\n"
+                                   "    if (f(1, 2) != 2) return 1;\n"
+                                   "}\n");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_nocrash_lambda) {
     CBMFileResult *r = extract_cpp("\n"
                                    "void test() {\n"
@@ -15144,6 +15162,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_nocrash_template_expression);
     RUN_TEST(clsp_nocrash_template_extra_call_args);
     RUN_TEST(clsp_nocrash_template_function_multi_param_nested_call);
+    RUN_TEST(clsp_nocrash_issue312_default_template_auto_param);
     RUN_TEST(clsp_nocrash_lambda);
     RUN_TEST(clsp_nocrash_nested_namespace);
     RUN_TEST(clsp_nocrash_empty_source);
