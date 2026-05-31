@@ -39,6 +39,11 @@ jobs:
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
+    # GitHub is sunsetting Intel-macOS runners, so the macos-15-intel leg is
+    # frequently cancelled before it can be allocated. Mark only that leg
+    # non-blocking so a scarce runner can't gate the aggregate build result
+    # (and thus skip smoke/soak in the dry-run). All other legs stay required.
+    continue-on-error: ${{ matrix.os == 'macos-15-intel' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
