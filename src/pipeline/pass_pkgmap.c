@@ -14,16 +14,17 @@
 #include "pipeline/pipeline_internal.h"
 #include "discover/discover.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
+#include "foundation/win_utf8.h"
 #include "foundation/yaml.h"
 
 #include <yyjson/yyjson.h>
 
-#include <dirent.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +64,13 @@ enum {
     PKGMAP_LINE_BUF = 512,
     PKGMAP_HT_INIT = 64,
     PKGMAP_ITOA_BUF = 16,
+    /* Hard ceiling on recursive directory descent. This is the
+     * non-negotiable termination guarantee for the manifest walk: even
+     * if the filesystem contains directory junctions / symlink cycles
+     * (the documented reason the walk was once disabled on Windows),
+     * descent stops at this depth so the walk can never hang. 64 is far
+     * deeper than any real source tree. */
+    PKGMAP_WALK_MAX_DEPTH = 64,
     /* String lengths for manifest parsing (avoid magic numbers in memcmp) */
     TOML_NAME_LEN = 4,      /* strlen("name") */
     TOML_NAME_SP = 5,       /* strlen("name ") */
@@ -767,6 +775,60 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
     return ends_with(basename, ".gemspec");
 }
 
+/* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip.
+ * On POSIX, lstat + S_ISLNK avoids following symlink cycles. On Windows
+ * we use the UTF-8-safe wide stat (mirroring discover.c's wide_stat);
+ * reparse points (junctions/symlinks) are detected separately by
+ * pkgmap_is_reparse_point below before we descend. Mirrors discover.c's
+ * safe_stat. */
+static int pkgmap_safe_stat(const char *abs_path, struct stat *st) {
+#ifdef _WIN32
+    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    if (!wpath) {
+        return CBM_NOT_FOUND;
+    }
+    struct _stat64 wst;
+    int ret = _wstat64(wpath, &wst);
+    free(wpath);
+    if (ret != 0) {
+        return CBM_NOT_FOUND;
+    }
+    st->st_mode = wst.st_mode;
+    st->st_size = wst.st_size;
+    st->st_mtime = wst.st_mtime;
+    return 0;
+#else
+    if (lstat(abs_path, st) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (S_ISLNK(st->st_mode)) {
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+#endif
+}
+
+/* True if abs_path is a Windows reparse point (directory junction or
+ * symlink). Following these is the documented cause of the historic CI
+ * hang, so we skip them before recursing. On POSIX this is a no-op
+ * (symlinks are already filtered by pkgmap_safe_stat's S_ISLNK check).
+ * Note: the PKGMAP_WALK_MAX_DEPTH bound below is the hard termination
+ * guarantee; this check is a best-effort early skip on top of it. */
+#ifdef _WIN32
+static bool pkgmap_is_reparse_point(const char *abs_path) {
+    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    if (!wpath) {
+        return false;
+    }
+    DWORD attrs = GetFileAttributesW(wpath);
+    free(wpath);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+#endif
+
 /* Recursive filesystem walker that finds and parses package manifest
  * files independently of the main discovery filter. The main discovery
  * filter intentionally hides package.json / composer.json etc. from
@@ -776,19 +838,26 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
  * node_modules, .git, build, etc. Returns the number of manifests
  * parsed, accumulated across the whole walk.
  *
- * POSIX-only: lstat + S_ISLNK skipping avoids following symlink cycles.
- * The Windows port (junction-safe descent) is a follow-up; cbm_pkgmap_scan_repo
- * is a no-op on Windows so this is never reached there. */
-#ifndef _WIN32
-static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries) {
-    DIR *dir = opendir(abs_dir);
+ * Cross-platform: uses the portable cbm_opendir/cbm_readdir/cbm_closedir
+ * API (same as src/discover/discover.c) and the symlink-skipping
+ * pkgmap_safe_stat. Termination is guaranteed by the PKGMAP_WALK_MAX_DEPTH
+ * recursion bound — even directory junctions / symlink cycles cannot make
+ * it hang. On Windows we additionally skip reparse points before
+ * descending as a best-effort early-out. */
+static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
+                           int depth) {
+    if (depth >= PKGMAP_WALK_MAX_DEPTH) {
+        cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
+        return 0;
+    }
+    cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
         return 0;
     }
     int parsed = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        const char *name = entry->d_name;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        const char *name = entry->name;
         if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
             continue;
         }
@@ -801,25 +870,23 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
             snprintf(rel_path, sizeof(rel_path), "%s", name);
         }
         struct stat st;
-#ifdef _WIN32
-        /* Windows has no lstat/S_ISLNK; symlinks aren't a concern for the
-         * MSYS2 build, so a plain stat is sufficient here. */
-        if (stat(abs_path, &st) != 0) {
+        if (pkgmap_safe_stat(abs_path, &st) != 0) {
             continue;
         }
-#else
-        if (lstat(abs_path, &st) != 0) {
-            continue;
-        }
-        if (S_ISLNK(st.st_mode)) {
-            continue;
-        }
-#endif
         if (S_ISDIR(st.st_mode)) {
             if (cbm_should_skip_dir(name, CBM_MODE_FULL)) {
                 continue;
             }
-            parsed += pkgmap_walk_dir(abs_path, rel_path, entries);
+#ifdef _WIN32
+            /* Don't follow Windows directory junctions — they can form
+             * cycles. The depth bound is the hard guarantee; this just
+             * avoids wasted descent. (POSIX symlinks are already skipped by
+             * pkgmap_safe_stat's S_ISLNK check.) */
+            if (pkgmap_is_reparse_point(abs_path)) {
+                continue;
+            }
+#endif
+            parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
@@ -838,35 +905,28 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         }
         free(source);
     }
-    closedir(dir);
+    cbm_closedir(dir);
     return parsed;
 }
-#endif /* !_WIN32 */
 
 /* Scan a repository for package manifest files via the filesystem
  * walker above. Always-available companion to the parallel path's
  * per-worker manifest parsing, which is bound to whatever `files[]`
  * the discoverer produces and therefore misses ignored manifests like
- * package.json. NULL-safe; returns 0 entries when repo_path is unset. */
+ * package.json. NULL-safe; returns 0 entries when repo_path is unset.
+ *
+ * Cross-platform: the walk runs on every platform via pkgmap_walk_dir,
+ * which is depth-bounded (PKGMAP_WALK_MAX_DEPTH) and skips symlinks /
+ * Windows reparse points, so it cannot hang on directory junctions.
+ * This is what lets bare workspace imports (e.g. "@org/pkg" declared in
+ * an ignored package.json) resolve on Windows as well as POSIX. */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries) {
     if (!repo_path || !entries) {
         return 0;
     }
-#ifdef _WIN32
-    /* The repo-wide manifest walk is POSIX-only for now: on Windows the
-     * recursive descent has hung in CI (no lstat/reparse-point skipping, so
-     * directory junctions can be followed into cycles). Fall back to the
-     * files[]-based pkgmap (baseline behavior) until the walk is made
-     * junction-safe on Windows. Workspace-import resolution from ignored
-     * manifests (package.json) is therefore Linux/macOS-only for now. */
-    (void)entries;
-    cbm_log_info("pkgmap.scan_repo", "skipped", "win32");
-    return 0;
-#else
-    int parsed = pkgmap_walk_dir(repo_path, "", entries);
+    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
-#endif
 }
 
 /* Build pkgmap for sequential path (reads manifest files directly) */
