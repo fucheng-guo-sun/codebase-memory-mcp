@@ -13,8 +13,16 @@ The tree-sitter C runtime is vendored in `internal/cbm/vendored/ts_runtime/`.
 - **License:** MIT
 - **Copyright:** (c) 2018–2024 Max Brunsfeld
 
-The shared scanner helpers in `internal/cbm/vendored/common/` originate from
-[tree-sitter-html](https://github.com/tree-sitter/tree-sitter-html) (MIT).
+The shared scanner helpers in `internal/cbm/vendored/common/` (`scanner.h`,
+`tag.h`) originate from
+[tree-sitter-html](https://github.com/tree-sitter/tree-sitter-html) (MIT,
+(c) 2014 Max Brunsfeld) and carry that project's `LICENSE` in
+`internal/cbm/vendored/common/`.
+
+The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
+(`alloc.h`, `array.h`, `parser.h`) are part of the tree-sitter C runtime
+([tree-sitter](https://github.com/tree-sitter/tree-sitter), MIT,
+(c) 2018 Max Brunsfeld) and carry their own `LICENSE` in that directory.
 
 ## Tree-sitter Grammars
 
