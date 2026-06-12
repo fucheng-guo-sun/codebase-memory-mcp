@@ -42,7 +42,7 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".cargo", ".stack-work", ".dart_tool", "zig-cache", "zig-out", ".metals", ".bloop", ".bsp",
     ".ccls-cache", ".clangd", "elm-stuff", "_opam", ".cpcache", ".shadow-cljs",
     /* Deploy */
-    ".vercel", ".netlify",
+    ".vercel", ".netlify", "deploy", "deployed",
     /* Misc */
     ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
 

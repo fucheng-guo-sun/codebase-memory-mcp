@@ -605,6 +605,27 @@ TEST(discover_generic_dirs_fast_mode) {
     PASS();
 }
 
+TEST(discover_deploy_excluded_full_mode) {
+    char *base = th_mktempdir("cbm_disc_deploy");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "deploy/main.go"), "package deploy\n");
+    th_write_file(TH_PATH(base, "deployed/main.go"), "package deployed\n");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_cbmignore_no_git) {
     char *base = th_mktempdir("cbm_disc_nogit");
     ASSERT(base != NULL);
@@ -792,6 +813,7 @@ SUITE(discover) {
     RUN_TEST(discover_new_ignore_patterns);
     RUN_TEST(discover_generic_dirs_full_mode);
     RUN_TEST(discover_generic_dirs_fast_mode);
+    RUN_TEST(discover_deploy_excluded_full_mode);
     RUN_TEST(discover_cbmignore_no_git);
 
     /* Nested .gitignore tests (issue #178) */
