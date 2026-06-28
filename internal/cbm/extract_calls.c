@@ -322,13 +322,23 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
 
 // Haskell/OCaml: extract callee from apply/infix nodes.
 static char *extract_fp_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
-    if (strcmp(nk, "apply") == 0 || strcmp(nk, "application_expression") == 0) {
+    if (strcmp(nk, "apply") == 0 || strcmp(nk, "application_expression") == 0 ||
+        strcmp(nk, "exp_apply") == 0) {
         if (ts_node_child_count(node) > 0) {
             TSNode callee = ts_node_child(node, 0);
             const char *ck = ts_node_type(callee);
             if (strcmp(ck, "identifier") == 0 || strcmp(ck, "variable") == 0 ||
-                strcmp(ck, "constructor") == 0 || strcmp(ck, "value_path") == 0) {
+                strcmp(ck, "constructor") == 0 || strcmp(ck, "value_path") == 0 ||
+                /* PureScript: exp_apply's function head is an `exp_name` whose
+                 * text is the (possibly qualified) function name. */
+                strcmp(ck, "exp_name") == 0) {
                 return cbm_node_text(a, callee, source);
+            }
+            /* Curried application `f a b` nests exp_apply/apply — descend the
+             * function head to recover the leftmost callee. */
+            if (strcmp(ck, "exp_apply") == 0 || strcmp(ck, "apply") == 0 ||
+                strcmp(ck, "application_expression") == 0) {
+                return extract_fp_callee(a, callee, source, ck);
             }
         }
     }
@@ -1081,7 +1091,7 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     if (lang == CBM_LANG_ERLANG) {
         return extract_erlang_callee(a, node, source, nk);
     }
-    if (lang == CBM_LANG_HASKELL || lang == CBM_LANG_OCAML) {
+    if (lang == CBM_LANG_HASKELL || lang == CBM_LANG_OCAML || lang == CBM_LANG_PURESCRIPT) {
         return extract_fp_callee(a, node, source, nk);
     }
     if (lang == CBM_LANG_WOLFRAM && strcmp(nk, "apply") == 0) {
