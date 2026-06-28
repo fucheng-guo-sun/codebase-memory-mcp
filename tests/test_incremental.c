@@ -310,6 +310,18 @@ TEST(incr_full_index) {
         rss_limit_mb = 2816;
     }
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__)
+    /* ARM Linux uses 4KB pages, so the page-size bump above does NOT fire there,
+     * yet glibc's per-CPU malloc arenas + allocation rounding still inflate RSS
+     * to the documented ~2385MB for this index (the same inflation Apple silicon
+     * shows, which the page-size check catches via its 16KB pages). Apply the
+     * higher ARM budget on any ARM target so the guard still catches a real leak
+     * (GBs over) without false-failing on 4KB-page ARM Linux (e.g. CI's
+     * ubuntu-22.04-arm, which measured 2386MB against the un-bumped 2048 limit). */
+    if (rss_limit_mb < 2816) {
+        rss_limit_mb = 2816;
+    }
+#endif
     ASSERT_LT((int)rss_delta_mb, rss_limit_mb);
 
     printf("    [perf] full: %d nodes, %d edges (%d CALLS, %d IMPORTS) "
