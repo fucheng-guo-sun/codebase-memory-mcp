@@ -565,6 +565,21 @@ char *cbm_mcp_tools_list(void) {
     return cbm_mcp_tools_list_range(0, TOOL_COUNT, false);
 }
 
+/* Return the JSON input_schema string for a tool by name, or NULL if unknown.
+ * Used by the CLI to build --flag arguments and per-tool --help from the same
+ * source of truth the MCP tools/list advertises. Static lifetime; do not free. */
+const char *cbm_mcp_tool_input_schema(const char *tool_name) {
+    if (!tool_name) {
+        return NULL;
+    }
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(TOOLS[i].name, tool_name) == 0) {
+            return TOOLS[i].input_schema;
+        }
+    }
+    return NULL;
+}
+
 static int mcp_tools_cursor_offset(const char *params_json) {
     if (!params_json) {
         return 0;

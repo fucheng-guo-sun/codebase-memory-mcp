@@ -61,6 +61,10 @@ bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
 /* Format the tools/list response. Returns heap-allocated JSON. */
 char *cbm_mcp_tools_list(void);
 
+/* Return a tool's JSON input_schema string by name (static; do not free), or
+ * NULL if the tool is unknown. Backs the CLI flag parser + per-tool --help. */
+const char *cbm_mcp_tool_input_schema(const char *tool_name);
+
 /* Format the initialize response. params_json is the raw initialize params
  * (used for protocol version negotiation). Returns heap-allocated JSON. */
 char *cbm_mcp_initialize_response(const char *params_json);

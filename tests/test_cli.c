@@ -2801,6 +2801,96 @@ TEST(replace_binary_creates_new_file) {
 #endif /* _WIN32 */
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  CLI tool-argument flags / per-tool --help (#680)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* A plain `--flag value` pair maps to a string property by schema type. */
+TEST(cli_build_args_json_string_flag_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--repo-path", "/x"};
+    char *json = cbm_cli_build_args_json("index_repository", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(err);
+    ASSERT(strstr(json, "\"repo_path\":\"/x\"") != NULL);
+    free(json);
+    PASS();
+}
+
+/* An integer-typed property serializes as a JSON NUMBER, not a quoted string. */
+TEST(cli_build_args_json_integer_flag_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--limit", "100"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"limit\":100") != NULL);
+    ASSERT(strstr(json, "\"limit\":\"100\"") == NULL);
+    free(json);
+    PASS();
+}
+
+/* A bare boolean flag (no value) becomes true. */
+TEST(cli_build_args_json_bare_boolean_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--exclude-entry-points"};
+    char *json = cbm_cli_build_args_json("search_graph", 1, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"exclude_entry_points\":true") != NULL);
+    free(json);
+    PASS();
+}
+
+/* A repeated array-typed flag accumulates into a JSON array. */
+TEST(cli_build_args_json_repeated_array_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "send", "--semantic-query", "publish"};
+    char *json = cbm_cli_build_args_json("search_graph", 4, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"send\",\"publish\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* kebab-case flag names map to snake_case JSON keys. */
+TEST(cli_build_args_json_kebab_to_snake_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--name-pattern", "Foo.*"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"name_pattern\":\"Foo.*\"") != NULL);
+    free(json);
+    PASS();
+}
+
+/* `--key=value` form splits on the FIRST `=`; value may contain spaces/dashes. */
+TEST(cli_build_args_json_key_equals_value_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--repo-path=/a b"};
+    char *json = cbm_cli_build_args_json("index_repository", 1, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"repo_path\":\"/a b\"") != NULL);
+    free(json);
+    PASS();
+}
+
+/* A non-`--` positional is an error: returns NULL and sets *err_out. */
+TEST(cli_build_args_json_bad_positional_errors_issue680) {
+    char *err = NULL;
+    char *argv[] = {"foo"};
+    char *json = cbm_cli_build_args_json("search_graph", 1, argv, &err);
+    ASSERT_NULL(json);
+    ASSERT_NOT_NULL(err);
+    free(err);
+    PASS();
+}
+
+/* Per-tool --help returns 0 for a known tool, -1 for an unknown one. */
+TEST(cli_print_tool_help_issue680) {
+    ASSERT_EQ(cbm_cli_print_tool_help("index_repository"), 0);
+    ASSERT_EQ(cbm_cli_print_tool_help("nope_not_a_tool"), -1);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -2963,4 +3053,14 @@ SUITE(cli) {
     RUN_TEST(replace_binary_overwrites_readonly);
     RUN_TEST(replace_binary_creates_new_file);
 #endif
+
+    /* CLI tool-argument flags / per-tool --help (#680) */
+    RUN_TEST(cli_build_args_json_string_flag_issue680);
+    RUN_TEST(cli_build_args_json_integer_flag_issue680);
+    RUN_TEST(cli_build_args_json_bare_boolean_issue680);
+    RUN_TEST(cli_build_args_json_repeated_array_issue680);
+    RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
+    RUN_TEST(cli_build_args_json_key_equals_value_issue680);
+    RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
+    RUN_TEST(cli_print_tool_help_issue680);
 }
