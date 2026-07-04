@@ -2841,6 +2841,13 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                                   memory_order_relaxed);
     }
 
+    /* Tear down this worker's thread-local parser + slab state, mirroring
+     * extract_worker. Without this, resolve-worker pages keep an owner pointer
+     * into dead TLS and are never retired, so a later cross-thread free can
+     * never bring their refcount to zero (leak). Retiring them here releases
+     * each page as its final chunk returns. */
+    cbm_destroy_thread_parser();
+    cbm_slab_destroy_thread();
     cbm_service_pattern_cache_end();
 }
 

@@ -8,6 +8,7 @@
 #include "../src/foundation/mem.h"
 #include "../src/foundation/arena.h"
 #include "../src/foundation/slab_alloc.h"
+#include "../src/foundation/compat_thread.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
@@ -611,6 +612,124 @@ TEST(slab_mixed_alloc_free_stress) {
     PASS();
 }
 
+/* ── Cross-thread slab-free safety (distilled from PR #782, closes #852) ──
+ *
+ * Tree-sitter's allocator callbacks are process-global: a ≤64B chunk allocated
+ * on parser thread A can be freed on parser thread B. The pre-fix thread-local
+ * slab_owns() only scanned the FREEING thread's pages, so a cross-thread free
+ * missed A's pages and fell through to free() on a pointer INTERIOR to a
+ * malloc'd page (invalid free / SIGABRT). Separately (#852), destroying/
+ * reclaiming a thread's slab while a live chunk is still referenced by a
+ * tree-sitter lexer freed the page under it (heap-use-after-free).
+ *
+ * These are RED on main (invalid free / UAF, caught by ASan) and GREEN with
+ * the O(1) aligned-page + retire-on-live-count allocator. */
+
+typedef struct {
+    void *ptr;
+    atomic_int *go;
+} slab_cross_thread_free_ctx_t;
+
+static void *slab_cross_thread_free_worker(void *arg) {
+    slab_cross_thread_free_ctx_t *ctx = (slab_cross_thread_free_ctx_t *)arg;
+    while (ctx->go && !atomic_load_explicit(ctx->go, memory_order_acquire)) {
+        cbm_usleep(1000);
+    }
+    /* Free on a DIFFERENT thread than the one that allocated. On main this
+     * falls through to free() on an interior slab pointer → invalid free. */
+    cbm_slab_test_free(ctx->ptr);
+    return NULL;
+}
+
+/* #852 exact guard — deterministic, single-thread, NOT cross-suite-order
+ * dependent. Destroy the current thread's slab while a chunk is still live,
+ * then read and free the chunk. On main, destroy frees the page → the read is
+ * a heap-use-after-free and the free is an invalid free. With retire-on-
+ * live-count the page is retired (not freed) while the chunk lives and released
+ * only when the final chunk returns. */
+TEST(slab_destroy_thread_with_live_chunk_no_uaf) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(48); /* ≤64B → slab chunk */
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x7E, 48);
+
+    /* Tear down slab TLS with p still referenced (models the live lexer). */
+    cbm_slab_destroy_thread();
+
+    /* p must still be valid — its page is retired, not freed. */
+    for (int i = 0; i < 48; i++) {
+        ASSERT_EQ(((unsigned char *)p)[i], 0x7E);
+    }
+
+    /* Returning the last live chunk releases the retired page (no leak). */
+    cbm_slab_test_free(p);
+    PASS();
+}
+
+TEST(slab_cross_thread_free_is_safe) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(32);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x5A, 32);
+
+    atomic_int go;
+    atomic_init(&go, 1);
+    slab_cross_thread_free_ctx_t ctx = {.ptr = p, .go = &go};
+    cbm_thread_t t;
+    ASSERT_EQ(cbm_thread_create(&t, 0, slab_cross_thread_free_worker, &ctx), 0);
+    ASSERT_EQ(cbm_thread_join(&t), 0);
+
+    cbm_slab_destroy_thread();
+    PASS();
+}
+
+TEST(slab_reclaim_with_foreign_live_chunk_is_safe) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(32);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xA5, 32);
+
+    atomic_int go;
+    atomic_init(&go, 0);
+    slab_cross_thread_free_ctx_t ctx = {.ptr = p, .go = &go};
+    cbm_thread_t t;
+    ASSERT_EQ(cbm_thread_create(&t, 0, slab_cross_thread_free_worker, &ctx), 0);
+
+    /* Reclaim while another thread still owns a live chunk from our page.
+     * On main, reclaim frees the page → the pending cross-thread free is a
+     * use-after-free. With retire-on-live-count, the page is retired. */
+    cbm_slab_reclaim();
+    atomic_store_explicit(&go, 1, memory_order_release);
+    ASSERT_EQ(cbm_thread_join(&t), 0);
+
+    cbm_slab_destroy_thread();
+    PASS();
+}
+
+TEST(slab_destroy_with_foreign_live_chunk_is_safe) {
+    cbm_slab_install();
+
+    void *p = cbm_slab_test_malloc(32);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x3C, 32);
+
+    atomic_int go;
+    atomic_init(&go, 0);
+    slab_cross_thread_free_ctx_t ctx = {.ptr = p, .go = &go};
+    cbm_thread_t t;
+    ASSERT_EQ(cbm_thread_create(&t, 0, slab_cross_thread_free_worker, &ctx), 0);
+
+    /* Destroy TLS while another thread still owns a live chunk. */
+    cbm_slab_destroy_thread();
+    atomic_store_explicit(&go, 1, memory_order_release);
+    ASSERT_EQ(cbm_thread_join(&t), 0);
+
+    PASS();
+}
+
 /* ── Parallel extraction integration test ──────────────────── */
 
 static char g_mem_tmpdir[256];
@@ -920,6 +1039,11 @@ SUITE(mem) {
     RUN_TEST(slab_realloc_slab_to_heap);
     RUN_TEST(slab_calloc_zeroed);
     RUN_TEST(slab_mixed_alloc_free_stress);
+    /* Cross-thread free safety + retire-on-live-count (#782 / #852) */
+    RUN_TEST(slab_destroy_thread_with_live_chunk_no_uaf);
+    RUN_TEST(slab_cross_thread_free_is_safe);
+    RUN_TEST(slab_reclaim_with_foreign_live_chunk_is_safe);
+    RUN_TEST(slab_destroy_with_foreign_live_chunk_is_safe);
     /* Integration */
     RUN_TEST(parallel_extract_without_source_retention);
     RUN_TEST(parallel_extract_tiny_source_retention_budget);
