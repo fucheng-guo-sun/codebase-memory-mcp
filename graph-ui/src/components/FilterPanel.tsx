@@ -22,8 +22,9 @@ interface FilterPanelProps {
   onToggleShowOnlyDead: () => void;
   onToggleHideEntryPoints: () => void;
   onToggleHideTests: () => void;
-  /* Missed graph (#963): file structure of not-fully-indexed files */
+  /* Missed skeleton (#963): white satellite of not-fully-indexed files */
   missedView: boolean;
+  missedCount: number;
   onToggleMissedView: () => void;
 }
 
@@ -80,6 +81,7 @@ export function FilterPanel({
   onToggleHideEntryPoints,
   onToggleHideTests,
   missedView,
+  missedCount,
   onToggleMissedView,
 }: FilterPanelProps) {
   const { labelCounts, edgeTypeCounts, statusCounts } = useMemo(() => {
@@ -168,25 +170,30 @@ export function FilterPanel({
         </div>
       </ScrollArea>
 
-      {/* Missed graph (#963): swaps the layout to the file structure of files
-          the indexer could not fully cover (best-effort signal). */}
+      {/* Missed skeleton (#963): white satellite cluster of files the indexer
+          could not fully cover, shown beside the code galaxy. Click it to
+          focus; click the code galaxy to come back. */}
       <div className="px-4 pt-2 border-t border-border/30 space-y-2 shrink-0">
         <div className="flex items-center justify-between">
           <span className="text-[10px] text-foreground/30 uppercase tracking-widest">
-            Graph
+            Missed files
           </span>
+          {missedCount > 0 && (
+            <span className="text-[10px] text-foreground/50 tabular-nums">
+              {missedCount.toLocaleString()} files
+            </span>
+          )}
         </div>
         <CheckRow
           checked={missedView}
           onToggle={onToggleMissedView}
-          label="Missed files (not fully indexed)"
+          label="Show missed skeleton"
         />
-        {missedView && (
-          <p className="text-[9px] leading-snug text-foreground/30">
-            Best-effort: files with unparseable regions or skips. Empty = no
-            known misses (not a completeness guarantee).
-          </p>
-        )}
+        <p className="text-[9px] leading-snug text-foreground/30">
+          {missedCount > 0
+            ? "White satellite = files not fully indexed (best-effort). Click it to focus, click the galaxy to return."
+            : "No known misses (best-effort — not a completeness guarantee)."}
+        </p>
       </div>
 
       {/* Dead-code view */}
