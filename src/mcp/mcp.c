@@ -811,10 +811,8 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
     }
 
     char real[CBM_SZ_4K];
-    /* Wide-path canonicalization: the old _access/_fullpath pair decoded the
-     * UTF-8 repo_path through the ANSI codepage and corrupted CJK paths on
-     * CJK-locale systems (#973). */
-    if (cbm_canonical_path(repo_path, real, sizeof(real))) {
+#ifdef _WIN32
+    if (_access(repo_path, 0) == 0 && _fullpath(real, repo_path, sizeof(real))) {
         cbm_normalize_path_sep(real);
         char *canonical = heap_strdup(real);
         if (canonical) {
@@ -822,6 +820,16 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
             return canonical;
         }
     }
+#else
+    if (realpath(repo_path, real)) {
+        cbm_normalize_path_sep(real);
+        char *canonical = heap_strdup(real);
+        if (canonical) {
+            free(repo_path);
+            return canonical;
+        }
+    }
+#endif
 
     return repo_path;
 }
@@ -5048,17 +5056,16 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
  * across preprocessor branches, which defeats source-level tooling that parses
  * without the preprocessor (and left this function unindexed in the graph). */
 static bool resolve_canonical_path(const char *path, char *out, size_t out_sz) {
-    /* cbm_canonical_path: realpath on POSIX; wide existence check +
-     * GetFullPathNameW on Windows (the old bare _fullpath was ANSI —
-     * CJK-locale corruption, #973 — and, unlike POSIX realpath, resolved
-     * nonexistent paths too; requiring existence aligns the platforms). */
-    if (!cbm_canonical_path(path, out, out_sz)) {
+#ifdef _WIN32
+    if (!_fullpath(out, path, out_sz)) {
         return false;
     }
-#ifdef _WIN32
     cbm_normalize_path_sep(out);
-#endif
     return true;
+#else
+    (void)out_sz;
+    return realpath(path, out) != NULL;
+#endif
 }
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path) {
