@@ -945,6 +945,38 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     PASS();
 }
 
+/* MCP discovery methods this server doesn't populate must return EMPTY
+ * lists, not -32601 Method-not-found: clients like Cline probe
+ * resources/list + prompts/list + resources/templates/list on connect and
+ * surface the errors as a failed connection (#958). */
+TEST(mcp_discovery_methods_return_empty_lists) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    struct {
+        const char *method;
+        const char *want;
+    } cases[] = {
+        {"resources/list", "\"resources\":[]"},
+        {"prompts/list", "\"prompts\":[]"},
+        {"resources/templates/list", "\"resourceTemplates\":[]"},
+    };
+    for (int i = 0; i < 3; i++) {
+        char reqbuf[256];
+        snprintf(reqbuf, sizeof(reqbuf),
+                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\"}", 100 + i,
+                 cases[i].method);
+        char *resp = cbm_mcp_server_handle(srv, reqbuf);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NULL(strstr(resp, "Method not found"));
+        ASSERT_NOT_NULL(strstr(resp, cases[i].want));
+        free(resp);
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_basic) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -5417,6 +5449,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+    RUN_TEST(mcp_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);

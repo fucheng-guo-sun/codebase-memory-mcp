@@ -7266,6 +7266,16 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         maybe_auto_index(srv);
     } else if (strcmp(req.method, "ping") == 0) {
         result_json = heap_strdup("{}");
+    } else if (strcmp(req.method, "resources/list") == 0) {
+        /* This server exposes no resources/prompts, but clients (Cline,
+         * others) probe these on connect regardless of declared
+         * capabilities and surface -32601 as a failed connection (#958).
+         * Empty lists are the interoperable answer. */
+        result_json = heap_strdup("{\"resources\":[]}");
+    } else if (strcmp(req.method, "resources/templates/list") == 0) {
+        result_json = heap_strdup("{\"resourceTemplates\":[]}");
+    } else if (strcmp(req.method, "prompts/list") == 0) {
+        result_json = heap_strdup("{\"prompts\":[]}");
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list_page(req.params_raw);
     } else if (strcmp(req.method, "tools/call") == 0) {
