@@ -1242,6 +1242,100 @@ static int calls_edge_between(cbm_store_t *store, const char *project, const cha
     return found;
 }
 
+/* #999: URLs in CI/tooling configs (.pre-commit-config.yaml, .github/
+ * workflows) are repository references for TOOLING, not endpoints this
+ * service exposes. They must not mint __route__infra__ Route nodes — the
+ * route matcher's root-service heuristic otherwise attaches every handler
+ * of an ambiguous "/" route to each junk URL (HANDLES churn on plain
+ * pallets/flask). */
+static int count_infra_routes_matching(cbm_store_t *store, const char *project,
+                                       const char *substr) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(store, project, "Route", &nodes, &count) != CBM_STORE_OK)
+        return -1;
+    int hits = 0;
+    for (int i = 0; i < count; i++) {
+        const char *qn = nodes[i].qualified_name;
+        if (qn && strncmp(qn, "__route__infra__", (sizeof("__route__infra__") - 1)) == 0 &&
+            strstr(qn, substr))
+            hits++;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return hits;
+}
+
+TEST(contract_edge_no_infra_routes_from_ci_configs_issue999) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"app.py", "from flask import Flask\n"
+                   "app = Flask(__name__)\n"
+                   "\n"
+                   "@app.route(\"/\")\n"
+                   "def index():\n"
+                   "    return \"hi\"\n"
+                   "\n"
+                   "@app.route(\"/auth/login\")\n"
+                   "def login():\n"
+                   "    return \"login\"\n"},
+        {".pre-commit-config.yaml", "repos:\n"
+                                    "  - repo: https://github.com/astral-sh/ruff-pre-commit\n"
+                                    "    rev: v0.1.0\n"
+                                    "    hooks:\n"
+                                    "      - id: ruff\n"
+                                    "  - repo: https://github.com/pre-commit/pre-commit-hooks\n"
+                                    "    rev: v4.5.0\n"
+                                    "    hooks:\n"
+                                    "      - id: trailing-whitespace\n"},
+        {".github/workflows/ci.yml", "name: CI\n"
+                                     "on: [push]\n"
+                                     "jobs:\n"
+                                     "  build:\n"
+                                     "    runs-on: ubuntu-latest\n"
+                                     "    steps:\n"
+                                     "      - uses: actions/checkout@v4\n"
+                                     "      - run: curl https://coverage.example.io/upload\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 3);
+    ASSERT_NOT_NULL(store);
+    /* No tooling URL may materialize as an infra Route node. */
+    int gh_routes = count_infra_routes_matching(store, lp.project, "github.com");
+    int wf_routes = count_infra_routes_matching(store, lp.project, "coverage.example.io");
+    if (gh_routes != 0 || wf_routes != 0) {
+        fprintf(stderr,
+                "  [999] FAIL infra routes from CI configs: github.com=%d workflows=%d "
+                "(expected 0/0)\n",
+                gh_routes, wf_routes);
+    }
+    ASSERT_EQ(gh_routes, 0);
+    ASSERT_EQ(wf_routes, 0);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
+/* #999 inverse guard: genuine infra endpoint URLs (Cloud Scheduler push
+ * targets and similar deployment configs) must STILL mint infra Route
+ * nodes — the CI/tooling deny must be file-scoped, not a blanket URL kill. */
+TEST(contract_edge_infra_routes_from_deploy_configs_still_minted) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"scheduler.yaml",
+         "jobs:\n"
+         "  - name: nightly-sync\n"
+         "    schedule: \"0 3 * * *\"\n"
+         "    push_endpoint: https://sync.internal.example/api/v1/sync\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 1);
+    ASSERT_NOT_NULL(store);
+    int routes = count_infra_routes_matching(store, lp.project, "sync.internal.example");
+    if (routes < 1) {
+        fprintf(stderr, "  [999] FAIL deploy-config endpoint minted %d infra routes "
+                        "(expected >=1)\n",
+                routes);
+    }
+    ASSERT_TRUE(routes >= 1);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* True if some CALLS edge's TARGET node carries `label` and a QN ending with
  * `qn_suffix` — i.e. the call resolved to that specific definition. */
 static int calls_edge_targets(cbm_store_t *store, const char *project, const char *label,
@@ -1563,6 +1657,8 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767);
     RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767);
     RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988);
+    RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
+    RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
     RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);

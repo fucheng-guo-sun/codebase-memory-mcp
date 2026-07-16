@@ -615,6 +615,47 @@ static bool is_infra_file(const char *fp) {
             strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
 }
 
+/* CI/tooling configs describe the development TOOLCHAIN — their URLs are
+ * repository/action/registry references, never endpoints this service
+ * exposes. Minting infra Route nodes from them lets the route matcher's
+ * root-service heuristic attach every handler of an ambiguous "/" route to
+ * each tooling URL (junk HANDLES churn on plain pallets/flask, #999).
+ * Deny by file identity, not URL shape: deployment configs (Cloud
+ * Scheduler, compose) keep minting their genuine endpoints. */
+static bool is_ci_tooling_config(const char *fp) {
+    if (!fp) {
+        return false;
+    }
+    if (strstr(fp, ".github/") != NULL || strstr(fp, ".gitlab/") != NULL ||
+        strstr(fp, ".circleci/") != NULL) {
+        return true;
+    }
+    const char *slash = strrchr(fp, '/');
+    const char *base = slash ? slash + 1 : fp;
+    static const char *const tooling[] = {".pre-commit-config.yaml",
+                                          ".pre-commit-hooks.yaml",
+                                          ".gitlab-ci.yml",
+                                          ".travis.yml",
+                                          "azure-pipelines.yml",
+                                          "appveyor.yml",
+                                          "bitbucket-pipelines.yml",
+                                          ".readthedocs.yaml",
+                                          ".readthedocs.yml",
+                                          "codecov.yml",
+                                          ".codecov.yml",
+                                          ".goreleaser.yaml",
+                                          ".goreleaser.yml",
+                                          ".golangci.yml",
+                                          ".golangci.yaml",
+                                          NULL};
+    for (int i = 0; tooling[i]; i++) {
+        if (strcmp(base, tooling[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* True when a YAML key path denotes an UPSTREAM dependency, CONFIG value, or
  * HEALTHCHECK target rather than an endpoint this service exposes. Such URLs
  * (auth JWKS, downstream service base URLs, package-registry URLs, healthcheck
@@ -683,7 +724,8 @@ static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_i
     CBMHashTable *denied = cbm_ht_create(16);
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < file_count; i++) {
-            if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
+            if (!result_cache[i] || !is_infra_file(files[i].rel_path) ||
+                is_ci_tooling_config(files[i].rel_path)) {
                 continue;
             }
             for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
