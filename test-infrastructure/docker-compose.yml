@@ -8,13 +8,23 @@
 
 services:
   # ── Linux test (ASan + UBSan + LeakSanitizer) ──────────────
+  # Default: unconstrained (speed first). CBM_LOCAL_CI_CPUS=4 enables
+  # CI-FIDELITY mode, mirroring the 4-core GitHub runners: deadline/starvation
+  # bugs (worker-readiness waits, watcher/subprocess deadlines) only reproduce
+  # under that constraint — run one capped pass before pushing anything that
+  # touches timing, scheduling, or subprocess code.
   test:
     build:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/arm64
+    cpus: ${CBM_LOCAL_CI_CPUS:-0}
     volumes:
       - ..:/src
+      - cbm-ccache-arm64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
     command: ["CC=gcc", "CXX=g++"]
 
   test-amd64:
@@ -22,8 +32,13 @@ services:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/amd64
+    cpus: ${CBM_LOCAL_CI_CPUS:-0}
     volumes:
       - ..:/src
+      - cbm-ccache-amd64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
     command: ["CC=gcc", "CXX=g++"]
 
   # ── Linux production build (-O2 -Werror) ───────────────────
@@ -172,3 +187,7 @@ services:
       dockerfile: test-infrastructure/Dockerfile.lint
     volumes:
       - ..:/src
+
+volumes:
+  cbm-ccache-arm64:
+  cbm-ccache-amd64:
