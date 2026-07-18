@@ -19,6 +19,7 @@
 #include <daemon/runtime.h>
 #include <daemon/version_cohort.h>
 #include <foundation/platform.h>
+#include <mcp/mcp.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
@@ -8550,6 +8551,48 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     PASS();
 }
 
+/* The PreToolUse augmenter parses search_graph's format:"json" payload to
+ * build additionalContext. This test feeds it the REAL envelope from a live
+ * in-memory server, so any drift between the response shape and the parser
+ * fails HERE — not only in the Windows CI guard (which caught exactly that:
+ * the json-tree reshape left the parser reading a key that no longer exists,
+ * and the hook silently emitted nothing). */
+TEST(cli_hook_augment_context_tracks_search_json_shape) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "hookproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/hookproj");
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "someIndexedSymbol",
+                    .qualified_name = "hookproj.mod.someIndexedSymbol",
+                    .file_path = "mod.py",
+                    .start_line = 1,
+                    .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    /* The exact request ha_build_args produces: format:"json". */
+    char *envelope =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"hookproj\",\"name_pattern\":\".*someIndexedSymbol.*\","
+                            "\"limit\":5,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(envelope);
+
+    bool is_error = true;
+    char *ctx =
+        cbm_hook_augment_format_context_for_testing(envelope, "someIndexedSymbol", &is_error);
+    ASSERT_FALSE(is_error);
+    ASSERT_NOT_NULL(ctx); /* one hit MUST produce context — empty = broken hook */
+    ASSERT_NOT_NULL(strstr(ctx, "someIndexedSymbol"));
+    ASSERT_NOT_NULL(strstr(ctx, "mod.py"));
+    free(ctx);
+    free(envelope);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(cli_hook_augment_lifecycle_output_contract) {
     static const struct {
         const char *event;
@@ -11678,6 +11721,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_hook_scripts_shell_quote_binary_path);
     RUN_TEST(cli_claude_hook_commands_shell_quote_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
+    RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);
     RUN_TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only);
