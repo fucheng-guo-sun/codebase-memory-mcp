@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Optional
 
 
 INITIALIZE_PARAMS = {
@@ -66,6 +66,21 @@ def read_json_lines(
 def drain(stream: BinaryIO, chunks: list[bytes]) -> None:
     for chunk in iter(lambda: stream.read(8192), b""):
         chunks.append(chunk)
+
+
+def daemon_log_tail(limit: int = 16384) -> str:
+    cache_dir = os.environ.get("CBM_CACHE_DIR")
+    if not cache_dir:
+        return ""
+    path = os.path.join(cache_dir, "logs", "cbm-daemon.log")
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - limit), os.SEEK_SET)
+            return stream.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def send(process: subprocess.Popen[bytes], message: dict[str, Any]) -> None:
@@ -141,6 +156,39 @@ def request(
         },
     )
     return wait_response(process, responses, request_id, timeout, accept_tool_error)
+
+
+def grouped_search_qualified_name(
+    structured: Any, expected_name: str
+) -> Optional[str]:
+    """Extract a qualified name from search_graph's grouped JSON tree."""
+    if not isinstance(structured, dict):
+        return None
+    columns = structured.get("cols")
+    groups = structured.get("groups")
+    if not isinstance(columns, list) or not isinstance(groups, list):
+        return None
+    try:
+        name_column = columns.index("name")
+    except ValueError:
+        return None
+
+    for group in groups:
+        if not isinstance(group, dict):
+            return None
+        prefix = group.get("qn_prefix")
+        rows = group.get("rows")
+        if not isinstance(prefix, str) or not isinstance(rows, list):
+            return None
+        for row in rows:
+            if not isinstance(row, list) or name_column >= len(row):
+                return None
+            name = row[name_column]
+            if not isinstance(name, str):
+                return None
+            if name == expected_name:
+                return f"{prefix}.{name}" if prefix else name
+    return None
 
 
 def run_scenario(
@@ -245,17 +293,8 @@ def run_scenario(
         if isinstance(discovery_result, dict)
         else None
     )
-    matches = (
-        discovery_structured.get("results")
-        if isinstance(discovery_structured, dict)
-        else None
-    )
-    qualified_name = (
-        matches[0].get("qualified_name")
-        if isinstance(matches, list) and matches and isinstance(matches[0], dict)
-        else None
-    )
-    if not isinstance(qualified_name, str) or not qualified_name:
+    qualified_name = grouped_search_qualified_name(discovery_structured, "compute")
+    if not qualified_name:
         raise SmokeFailure("search_graph did not discover compute's qualified name")
     request(
         process,
@@ -346,10 +385,18 @@ def main() -> int:
     except SmokeFailure as error:
         stop_process(process)
         stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        daemon_log = daemon_log_tail()
         print(f"FAIL: {error}", file=sys.stderr)
         if stderr:
             print("--- MCP stderr ---", file=sys.stderr)
             print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
+        if daemon_log:
+            print("--- daemon log (tail) ---", file=sys.stderr)
+            print(
+                daemon_log,
+                file=sys.stderr,
+                end="" if daemon_log.endswith("\n") else "\n",
+            )
         return 1
 
 

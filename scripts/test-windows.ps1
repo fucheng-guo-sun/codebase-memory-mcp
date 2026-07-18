@@ -133,24 +133,26 @@ Write-Host "Payload: $bin" -ForegroundColor Green
 Write-Host "Launcher: $launcherBin" -ForegroundColor Green
 Write-Host "ABI mismatch fixture: $abiMismatchLauncher" -ForegroundColor Green
 
-$localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
-if (-not $localAppData) { throw "could not resolve the current user's local application-data directory" }
-$guardRoot = Join-Path $localAppData "Temp"
-New-Item -ItemType Directory -Path $guardRoot -Force | Out-Null
-$guardBundle = Join-Path $guardRoot ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $guardBundle | Out-Null
-$guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"
-$guardPayload = Join-Path $guardBundle "codebase-memory-mcp.payload.exe"
-Copy-Item -LiteralPath $launcherBin -Destination $guardBin
-Copy-Item -LiteralPath $bin -Destination $guardPayload
-Write-Host "Guard bundle: $guardBin" -ForegroundColor Green
-
 $previousTemp = $env:TEMP
 $previousTmp = $env:TMP
 $previousTmpDir = $env:TMPDIR
+$guardRoot = $null
 try {
-    # The launcher deliberately rejects GitHub's shared D:\a ancestry. Keep
-    # launcher fixtures and Python-created descendants inside this account.
+    $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    if (-not $userProfile) { throw "could not resolve the current user's profile directory" }
+    $guardRoot = Join-Path $userProfile ("cbm-windows-guards-root-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $guardRoot | Out-Null
+    $guardBundle = Join-Path $guardRoot ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $guardBundle | Out-Null
+    $guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"
+    $guardPayload = Join-Path $guardBundle "codebase-memory-mcp.payload.exe"
+    Copy-Item -LiteralPath $launcherBin -Destination $guardBin
+    Copy-Item -LiteralPath $bin -Destination $guardPayload
+    Write-Host "Guard bundle: $guardBin" -ForegroundColor Green
+
+    # The launcher deliberately rejects GitHub's shared D:\a ancestry and the
+    # hosted runner's inherited LocalAppData\Temp ACL. Keep launcher fixtures
+    # and Python-created descendants below the accepted profile ancestry.
     $env:TEMP = $guardRoot
     $env:TMP = $guardRoot
     $env:TMPDIR = $guardRoot
@@ -215,10 +217,12 @@ if (-not $GuardsOnly) {
     }
 }
 } finally {
-    Remove-Item -LiteralPath $guardBundle -Recurse -Force -ErrorAction SilentlyContinue
     $env:TEMP = $previousTemp
     $env:TMP = $previousTmp
     $env:TMPDIR = $previousTmpDir
+    if ($guardRoot) {
+        Remove-Item -LiteralPath $guardRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host ""

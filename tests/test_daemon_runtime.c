@@ -15,6 +15,7 @@
 #include "daemon/ipc.h"
 #include "daemon/runtime.h"
 #include "daemon/service.h"
+#include "daemon/version_cohort.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -1396,6 +1397,92 @@ static bool runtime_test_read_log(const char *path, char out[RUNTIME_TEST_LOG_CA
     out[used] = '\0';
     (void)fclose(file);
     return complete;
+}
+
+/* A detached daemon loses its inherited stderr by design. Failures before the
+ * runtime listener exists must therefore reach the owner-private operation log
+ * or users and smoke tests see only a generic bootstrap timeout. An existing
+ * daemon claim deterministically fails before runtime startup. */
+TEST(daemon_host_early_coordination_failure_is_durable) {
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    bool had_cache = old_cache != NULL;
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    bool snapshot_ok = !had_cache || saved_cache;
+
+    char parent[RUNTIME_TEST_PATH_CAP] = {0};
+    char cache[RUNTIME_TEST_PATH_CAP] = {0};
+    char log_path[RUNTIME_TEST_PATH_CAP] = {0};
+    int parent_written =
+        snprintf(parent, sizeof(parent), "%s/cbm-host-early-log-XXXXXX", cbm_tmpdir());
+    bool parent_created = snapshot_ok && parent_written > 0 &&
+                          parent_written < (int)sizeof(parent) && cbm_mkdtemp(parent) != NULL;
+    int cache_written = parent_created ? snprintf(cache, sizeof(cache), "%s/cache", parent) : -1;
+    int log_written = parent_created
+                          ? snprintf(log_path, sizeof(log_path), "%s/logs/cbm-daemon.log", cache)
+                          : -1;
+    bool environment_ready = cache_written > 0 && cache_written < (int)sizeof(cache) &&
+                             log_written > 0 && log_written < (int)sizeof(log_path) &&
+                             cbm_mkdir_p(cache, 0700) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        environment_ready ? cbm_daemon_ipc_endpoint_new("0123456789abcdef", parent) : NULL;
+    cbm_version_cohort_manager_t *active_manager =
+        endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
+    cbm_version_cohort_lease_t *active_lease = NULL;
+    cbm_version_cohort_daemon_claim_t *active_claim = NULL;
+    cbm_daemon_conflict_t active_conflict;
+    cbm_daemon_build_identity_t active_identity =
+        runtime_test_identity("active-host", runtime_test_self_build());
+    active_identity.cache_fingerprint = RUNTIME_BUILD_B;
+    cbm_version_cohort_status_t active_status =
+        active_manager
+            ? cbm_version_cohort_acquire(active_manager, &active_identity, UINT64_MAX,
+                                         &active_lease, &active_conflict)
+            : CBM_VERSION_COHORT_IO;
+    cbm_version_cohort_status_t claim_status =
+        active_status == CBM_VERSION_COHORT_OK
+            ? cbm_version_cohort_daemon_claim_acquire(active_manager, &active_claim)
+            : CBM_VERSION_COHORT_IO;
+    atomic_int stop_requested = ATOMIC_VAR_INIT(0);
+    cbm_daemon_host_config_t config = {
+        .endpoint = endpoint,
+        .identity = active_identity,
+        .executable_path = "/host-early-log-test",
+        .stop_requested = &stop_requested,
+    };
+    int run_result = claim_status == CBM_VERSION_COHORT_OK ? cbm_daemon_host_run(&config) : 0;
+
+    char log[RUNTIME_TEST_LOG_CAP] = {0};
+    bool durable = runtime_test_read_log(log_path, log) &&
+                   strstr(log, "daemon.start_failed") != NULL &&
+                   strstr(log, "claim") != NULL;
+    bool endpoint_created = endpoint != NULL;
+    while (active_claim &&
+           cbm_version_cohort_daemon_claim_release(&active_claim) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    while (active_lease &&
+           cbm_version_cohort_lease_release(&active_lease) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    while (active_manager &&
+           cbm_version_cohort_manager_free(&active_manager) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    runtime_test_restore_environment("CBM_CACHE_DIR", saved_cache, had_cache);
+    free(saved_cache);
+    bool cleaned = !parent_created || th_rmtree(parent) == 0;
+
+    ASSERT_TRUE(snapshot_ok);
+    ASSERT_TRUE(parent_created);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(endpoint_created);
+    ASSERT_EQ(active_status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(claim_status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(run_result, -1);
+    ASSERT_TRUE(durable);
+    ASSERT_TRUE(cleaned);
+    PASS();
 }
 
 /* RED on the former host preparation contract: a failed _config.db open was
@@ -4166,6 +4253,7 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
 #endif
 
 SUITE(daemon_runtime) {
+    RUN_TEST(daemon_host_early_coordination_failure_is_durable);
     RUN_TEST(daemon_host_refuses_unopenable_runtime_config_database);
     RUN_TEST(daemon_host_http_reconcile_rate_limits_and_retries_transient_failures);
     RUN_TEST(daemon_host_http_retry_backoff_is_bounded);

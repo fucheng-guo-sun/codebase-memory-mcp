@@ -520,7 +520,9 @@ typedef struct bootstrap_production_cohort {
 
 typedef struct {
     bootstrap_production_cohort_t *cohort;
-#ifdef __APPLE__
+#ifdef _WIN32
+    DWORD spawn_error;
+#elif defined(__APPLE__)
     int spawn_error;
 #endif
 } bootstrap_production_context_t;
@@ -674,17 +676,29 @@ static bool bootstrap_production_handoff(void *context, cbm_daemon_bootstrap_loc
 #ifdef _WIN32
 static bool bootstrap_production_spawn(void *context,
                                        const cbm_daemon_bootstrap_launch_spec_t *spec) {
-    (void)context;
+    bootstrap_production_context_t *production = context;
+    if (production) {
+        production->spawn_error = ERROR_SUCCESS;
+    }
     if (!spec || !spec->detached || spec->inherit_standard_handles || spec->use_shell) {
+        if (production) {
+            production->spawn_error = ERROR_INVALID_PARAMETER;
+        }
         return false;
     }
     char command_line[BOOTSTRAP_PATH_CAP * 2];
     if (!cbm_build_win_cmdline(command_line, sizeof(command_line), spec->argv)) {
+        if (production) {
+            production->spawn_error = ERROR_INVALID_PARAMETER;
+        }
         return false;
     }
     wchar_t *application = cbm_utf8_to_wide(spec->executable_path);
     wchar_t *command = cbm_utf8_to_wide(command_line);
     if (!application || !command) {
+        if (production) {
+            production->spawn_error = ERROR_NOT_ENOUGH_MEMORY;
+        }
         free(application);
         free(command);
         return false;
@@ -712,8 +726,12 @@ static bool bootstrap_production_spawn(void *context,
     }
     BOOL created = CreateProcessW(application, command, NULL, NULL, FALSE, flags, NULL, NULL,
                                   &startup, &child);
+    DWORD spawn_error = created ? ERROR_SUCCESS : GetLastError();
     free(application);
     free(command);
+    if (production) {
+        production->spawn_error = spawn_error;
+    }
     if (!created) {
         return false;
     }
@@ -895,7 +913,15 @@ static bool bootstrap_production_spawn(void *context,
 
 static void bootstrap_production_diagnostic(void *context, const char *message) {
     bootstrap_production_context_t *production = context;
-#ifdef __APPLE__
+#ifdef _WIN32
+    if (production && production->spawn_error != ERROR_SUCCESS) {
+        (void)fprintf(stderr, "codebase-memory-mcp: %s (daemon launch error %lu)\n",
+                      message ? message : "daemon startup failed",
+                      (unsigned long)production->spawn_error);
+        (void)fflush(stderr);
+        return;
+    }
+#elif defined(__APPLE__)
     if (production && production->spawn_error != 0) {
         (void)fprintf(stderr, "codebase-memory-mcp: %s (daemon launch: %s)\n",
                       message ? message : "daemon startup failed",

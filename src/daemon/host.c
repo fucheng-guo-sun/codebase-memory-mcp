@@ -757,6 +757,12 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         !config->identity.semantic_version || !config->identity.build_fingerprint) {
         return -1;
     }
+    cbm_ui_log_init();
+    char conflict_log[HOST_PATH_CAP];
+    if (!host_log_open(conflict_log)) {
+        (void)fprintf(stderr, "codebase-memory: daemon log path is not private or safe\n");
+        return -1;
+    }
     cbm_version_cohort_manager_t *cohort_manager = cbm_version_cohort_manager_new(config->endpoint);
     cbm_version_cohort_lease_t *cohort_lease = NULL;
     cbm_daemon_conflict_t cohort_conflict;
@@ -770,6 +776,7 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                                          &cohort_lease, &cohort_conflict)
             : CBM_VERSION_COHORT_IO;
     if (cohort_status != CBM_VERSION_COHORT_OK) {
+        cbm_log_error("daemon.start_failed", "component", "cohort");
         char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
         bool formatted = cohort_status == CBM_VERSION_COHORT_CONFLICT &&
                          cbm_daemon_conflict_format(&cohort_conflict, message, sizeof(message));
@@ -779,41 +786,38 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         (void)fprintf(stderr, "codebase-memory: %s\n",
                       formatted ? message : "daemon exact-build admission failed");
         host_cohort_close(&cohort_lease, &cohort_manager);
+        host_log_close();
         return -1;
     }
     cbm_daemon_ipc_participant_guard_t *participant_guard = NULL;
     if (cbm_daemon_ipc_participant_guard_try_join(config->endpoint, &participant_guard) != 1) {
+        cbm_log_error("daemon.start_failed", "component", "participant");
         (void)fprintf(stderr, "codebase-memory: daemon participant admission failed\n");
         host_participant_guard_close(&participant_guard);
         host_cohort_close(&cohort_lease, &cohort_manager);
+        host_log_close();
         return -1;
     }
     cbm_daemon_ipc_lifetime_reservation_t *lifetime_reservation = NULL;
     if (host_lifetime_reservation_acquire(config->endpoint, &lifetime_reservation) != 1) {
+        cbm_log_error("daemon.start_failed", "component", "lifetime");
         host_participant_guard_close(&participant_guard);
         host_cohort_close(&cohort_lease, &cohort_manager);
+        host_log_close();
         return -1;
     }
     cbm_version_cohort_daemon_claim_t *daemon_claim = NULL;
     if (cbm_version_cohort_daemon_claim_acquire(cohort_manager, &daemon_claim) !=
         CBM_VERSION_COHORT_OK) {
+        cbm_log_error("daemon.start_failed", "component", "claim");
         cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
         host_daemon_claim_close(&daemon_claim);
         host_participant_guard_close(&participant_guard);
         host_cohort_close(&cohort_lease, &cohort_manager);
+        host_log_close();
         return -1;
     }
     cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
-    cbm_ui_log_init();
-    char conflict_log[HOST_PATH_CAP];
-    if (!host_log_open(conflict_log)) {
-        (void)fprintf(stderr, "codebase-memory: daemon log path is not private or safe\n");
-        cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
-        host_daemon_claim_close(&daemon_claim);
-        host_participant_guard_close(&participant_guard);
-        host_cohort_close(&cohort_lease, &cohort_manager);
-        return -1;
-    }
     cbm_http_server_set_binary_path(config->executable_path);
     cbm_index_supervisor_mark_host();
 

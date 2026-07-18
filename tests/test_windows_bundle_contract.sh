@@ -353,15 +353,25 @@ require(
     all(
         needle in windows_test_driver
         for needle in (
-            "[Environment+SpecialFolder]::LocalApplicationData",
-            '$guardRoot = Join-Path $localAppData "Temp"',
+            "[Environment+SpecialFolder]::UserProfile",
+            '$guardRoot = Join-Path $userProfile '
+            '("cbm-windows-guards-root-" + [guid]::NewGuid().ToString("N"))',
             '$env:TEMP = $guardRoot',
             '$env:TMP = $guardRoot',
             '$env:TMPDIR = $guardRoot',
+            'Remove-Item -LiteralPath $guardRoot -Recurse -Force',
         )
     ),
     "Windows launcher guards must keep staged and Python-created fixtures "
     "beneath the current account profile",
+)
+require(
+    '$guardRoot = $null\ntry {\n    $userProfile = '
+    '[Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)'
+    in windows_test_driver
+    and 'if ($guardRoot) {\n        Remove-Item -LiteralPath $guardRoot -Recurse -Force'
+    in windows_test_driver,
+    "Windows launcher guard setup must be covered by profile-fixture cleanup",
 )
 
 # Launcher supervision has two distinct failure directions: killing the

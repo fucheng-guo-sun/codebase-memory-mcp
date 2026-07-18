@@ -42,13 +42,12 @@ typedef struct {
     cbm_lock_registry_t *registry;
 } lock_registry_fixture_t;
 
+/* The stress fixtures that use this helper are POSIX-only. */
+#ifndef _WIN32
 static void lock_registry_test_yield(void) {
-#ifdef _WIN32
-    (void)SwitchToThread();
-#else
     (void)sched_yield();
-#endif
 }
+#endif
 
 #ifndef _WIN32
 static cbm_private_lock_directory_t *lock_registry_test_directory_open(const char *root) {
