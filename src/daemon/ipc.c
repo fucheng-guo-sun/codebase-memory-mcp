@@ -3875,7 +3875,13 @@ static bool win_bounded_sid_trusted(win_security_t *security, const uint8_t *sid
            security->get_length_sid((PSID)sid) == (DWORD)sid_length &&
            (win_sid_trusted(security, (PSID)sid) ||
             (creator_owner_inherit_only &&
-             security->is_well_known_sid((PSID)sid, WinCreatorOwnerSid)));
+             security->is_well_known_sid((PSID)sid, WinCreatorOwnerSid)) ||
+            /* OWNER RIGHTS (S-1-3-4) modulates the rights of whoever OWNS the
+             * object; the owner is separately validated as the exact current
+             * user, so such an ACE only ever grants to us. Default Windows
+             * profile/temp ACLs (and GitHub runner profiles) carry it, and
+             * rejecting it locked real current-user directories out. */
+            security->is_well_known_sid((PSID)sid, WinCreatorOwnerRightsSid));
 }
 
 static bool win_file_owner_secure(win_security_t *security, HANDLE file,

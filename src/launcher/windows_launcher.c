@@ -228,7 +228,11 @@ static bool launcher_bounded_ace_sid_is_trusted(const ACE_HEADER *header, PSID c
            GetLengthSid((PSID)sid) == (DWORD)sid_length &&
            (launcher_sid_is_trusted((PSID)sid, current_user) ||
             (((header->AceFlags & INHERIT_ONLY_ACE) != 0U) &&
-             IsWellKnownSid((PSID)sid, WinCreatorOwnerSid)));
+             IsWellKnownSid((PSID)sid, WinCreatorOwnerSid)) ||
+            /* OWNER RIGHTS (S-1-3-4) applies to the validated current-user
+             * owner; default profile ACLs carry it, and rejecting it locked
+             * the launcher out of legitimate current-user directories. */
+            IsWellKnownSid((PSID)sid, WinCreatorOwnerRightsSid));
 }
 
 static bool launcher_security_is_safe(HANDLE file, bool require_current_owner, DWORD mutation) {
