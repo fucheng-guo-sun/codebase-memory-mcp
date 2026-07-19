@@ -9548,15 +9548,15 @@ static bool cli_windows_prepare_install_pair(const wchar_t *launcher_source,
                       launcher_target);
         ready = false;
     }
-    if (ready && !cli_windows_stage_private_file(payload_source_utf8, payload_target,
-                                                 payload_fingerprint)) {
+    if (ready &&
+        !cli_windows_stage_private_file(payload_source_utf8, payload_target, payload_fingerprint)) {
         (void)fprintf(stderr, "error: private staging failed for the payload (%s)\n",
                       payload_target);
         ready = false;
     }
     if (ready && strcmp(payload_fingerprint, expected_payload_sha256) != 0) {
-        (void)fprintf(stderr,
-                      "error: staged payload build fingerprint did not match the expected payload\n");
+        (void)fprintf(
+            stderr, "error: staged payload build fingerprint did not match the expected payload\n");
         ready = false;
     }
     if (ready) {
