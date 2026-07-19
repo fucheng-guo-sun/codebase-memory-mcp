@@ -61,10 +61,13 @@ print_env "test.sh"
 echo "=== Step 0a: Windows launcher bundle contract ==="
 bash "$ROOT/tests/test_windows_bundle_contract.sh"
 
-echo "=== Step 0b: tree-sitter runtime Makefile dependencies ==="
+echo "=== Step 0b: Windows VM worktree sync contract ==="
+bash "$ROOT/tests/test_vm_worktree_manifest.sh"
+
+echo "=== Step 0c: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
-echo "=== Step 0c: security fuzz harness self-test ==="
+echo "=== Step 0d: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
 # Verify compiler supports target arch

@@ -8,9 +8,10 @@
 # Usage:
 #   win.sh status                  # reachability + repo + build state
 #   win.sh update                  # fetch+reset repo to pushed branch, rebuild
+#   win.sh sync                    # mirror this uncommitted worktree + rebuild
 #   win.sh build                   # incremental native build (binary+runner)
 #   win.sh test <suite...>         # run test-runner suites (native ARM64)
-#   win.sh guards                  # run the Windows guard scripts (python)
+#   win.sh guards                  # clean UI product build + Windows guards
 #   win.sh smoke-install           # real managed-install E2E (Phase 8 class)
 #   win.sh sh <command...>         # arbitrary command in CLANGARM64 env
 #   win.sh push-file <local> <vm>  # scp one file into the VM (WIP iteration)
@@ -21,17 +22,42 @@ set -euo pipefail
 
 CONFIG="${HOME}/.claude/cbm-vm/config"
 KEY="${HOME}/.claude/cbm-vm/id_ed25519"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# The fixed host-local config is intentionally outside this repository.
+# shellcheck source=/dev/null
 [ -f "$CONFIG" ] && . "$CONFIG"
 HOST="${CBM_VM_HOST:?set CBM_VM_HOST in ~/.claude/cbm-vm/config}"
 USER_="${CBM_VM_USER:-test}"
-BRANCH="${CBM_VM_BRANCH:-feat/shared-coordination-daemon}"
-JOBS='\$(nproc)'
+HOST_KEY="${CBM_VM_HOST_KEY_SHA256:?set CBM_VM_HOST_KEY_SHA256 in ~/.claude/cbm-vm/config}"
+LOCAL_BRANCH="$(git -C "$ROOT" branch --show-current)"
+BRANCH="${CBM_VM_BRANCH:-${LOCAL_BRANCH:-main}}"
+# Expand inside the remote MSYS2 shell, not on the macOS host.
+# shellcheck disable=SC2016
+JOBS='$(nproc)'
 
-SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-     -o ConnectTimeout=10 -o BatchMode=yes "${USER_}@${HOST}")
+# shellcheck source=test-infrastructure/vm/ssh-common.sh
+source "$SCRIPT_DIR/ssh-common.sh"
+cbm_vm_require_safe_branch "$BRANCH"
+cbm_vm_prepare_known_hosts "$HOST" "$HOST_KEY"
+WIN_MANIFEST=""
+WIN_ARCHIVE=""
+WIN_PATCH=""
+win_cleanup() {
+    [ -z "$WIN_MANIFEST" ] || rm -f -- "$WIN_MANIFEST"
+    [ -z "$WIN_ARCHIVE" ] || rm -f -- "$WIN_ARCHIVE"
+    [ -z "$WIN_PATCH" ] || rm -f -- "$WIN_PATCH"
+    cbm_vm_cleanup_known_hosts
+}
+trap win_cleanup EXIT
+SSH_OPTIONS=(-i "$KEY" -o IdentitiesOnly=yes -o HostKeyAlgorithms=ssh-ed25519 \
+             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$CBM_VM_KNOWN_HOSTS" \
+             -o ConnectTimeout=10 -o BatchMode=yes)
+SSH=(ssh "${SSH_OPTIONS[@]}" "${USER_}@${HOST}")
+SCP=(scp "${SSH_OPTIONS[@]}")
 
 vm() { local env="$1"; shift
-      "${SSH[@]}" "C:\\msys64\\msys2_shell.cmd -defterm -no-start -${env} -c \"$*\""; }
+      "${SSH[@]}" "C:\\msys64\\msys2_shell.cmd -defterm -no-start -${env} -c \"set -e -o pipefail; $*\""; }
 
 cmd="${1:-status}"; shift || true
 case "$cmd" in
@@ -40,7 +66,38 @@ status)
     vm clangarm64 "cd /c/cbm 2>/dev/null && git log --oneline -1 && ls -la build/c/codebase-memory-mcp.exe build/c/test-runner.exe 2>/dev/null || echo 'repo/build missing — run provision-windows.sh'"
     ;;
 update)
-    vm clangarm64 "cd /c/cbm && git fetch origin ${BRANCH} && git reset --hard FETCH_HEAD && git log --oneline -1"
+    vm clangarm64 "cd /c/cbm && git fetch origin ${BRANCH} && git reset --hard FETCH_HEAD && git clean -fdx && git log --oneline -1"
+    exec "$0" build
+    ;;
+sync)
+    local_head="$(git -C "$ROOT" rev-parse --verify HEAD)"
+    WIN_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/cbm-vm-manifest.XXXXXX")"
+    WIN_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/cbm-vm-worktree.XXXXXX.tar")"
+    WIN_PATCH="$(mktemp "${TMPDIR:-/tmp}/cbm-vm-worktree.XXXXXX.patch")"
+    git -C "$ROOT" diff --binary --full-index HEAD -- >"$WIN_PATCH"
+    cbm_vm_write_untracked_manifest "$ROOT" "$WIN_MANIFEST"
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
+        -C "$ROOT" --null -T "$WIN_MANIFEST" -cf "$WIN_ARCHIVE"
+    remote_head="$(vm clangarm64 "cd /c/cbm && git rev-parse --verify HEAD")"
+    remote_head="${remote_head//$'\r'/}"
+    if [ "$remote_head" != "$local_head" ]; then
+        echo "FATAL: Windows VM is at $remote_head, expected local HEAD $local_head; run win.sh update first." >&2
+        exit 1
+    fi
+    vm clangarm64 \
+        "cd /c/cbm && git reset --hard '$local_head' && git clean -fdx"
+    if [ -s "$WIN_PATCH" ]; then
+        "${SSH[@]}" \
+            'C:\msys64\msys2_shell.cmd -defterm -no-start -clangarm64 -c "cd /c/cbm && git apply --binary --whitespace=nowarn -"' \
+            <"$WIN_PATCH"
+    fi
+    if [ -s "$WIN_MANIFEST" ]; then
+        "${SSH[@]}" \
+            'C:\msys64\msys2_shell.cmd -defterm -no-start -clangarm64 -c "cd /c/cbm && tar -xf -"' \
+            <"$WIN_ARCHIVE"
+    fi
+    vm clangarm64 "cd /c/cbm && git status --short --branch"
+    win_cleanup
     exec "$0" build
     ;;
 build)
@@ -51,12 +108,16 @@ test)
     vm clangarm64 "cd /c/cbm && ./build/c/test-runner $* 2>&1 | tail -40"
     ;;
 guards)
-    vm clangarm64 "cd /c/cbm && for g in tests/windows/test_*.py; do echo \"== \\\$g ==\"; python \\\$g build/c/codebase-memory-mcp.exe 2>&1 | tail -6; done"
+    # Match the Windows CI product build: a clean, embedded-UI payload plus the
+    # permanent launcher. Passing those freshly built artifacts to the maintained
+    # PowerShell driver prevents an earlier non-UI `win.sh build` from silently
+    # turning product guards into precondition skips.
+    vm clangarm64 "cd /c/cbm && scripts/build.sh --with-ui CC=clang CXX=clang++ SANITIZE= && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe -Launcher build/c/codebase-memory-mcp-launcher.exe"
     ;;
 smoke-install)
     # Real managed install E2E with FULL stderr visible — the exact class the
-    # CI smoke Phase 8 exercises but cannot show (probe hides launcher stderr).
-    vm clangarm64 "cd /c/cbm && ./build/c/codebase-memory-mcp.exe install 2>&1 | tail -25"
+    # CI smoke Phase 8 exercises, isolated beneath a disposable profile root.
+    vm clangarm64 "cd /c/cbm && bash test-infrastructure/vm/vm-smoke.sh"
     ;;
 sh)
     vm clangarm64 "$*"
@@ -65,7 +126,7 @@ push-file)
     [ $# -eq 2 ] || { echo "usage: win.sh push-file <local-path> <vm-path>" >&2; exit 2; }
     # Windows OpenSSH resolves scp targets natively: use C:/... not /c/...
     dest="${2/#\/c\//C:\/}"
-    scp -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$1" "${USER_}@${HOST}:${dest}"
+    "${SCP[@]}" "$1" "${USER_}@${HOST}:${dest}"
     ;;
 ubsan-build)
     # x86_64 (CI's exact arch) with UBSan, runs under Windows-on-ARM emulation.

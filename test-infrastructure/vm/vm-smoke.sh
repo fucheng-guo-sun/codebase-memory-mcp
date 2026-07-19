@@ -9,7 +9,7 @@
 #
 # Run inside the VM's CLANGARM64 shell from the repo root:
 #   bash test-infrastructure/vm/vm-smoke.sh
-# Or from the host: test-infrastructure/vm/win.sh smoke
+# Or from the host: test-infrastructure/vm/win.sh smoke-install
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

@@ -1,9 +1,9 @@
-# VM test legs — real-Windows and runner-macOS
+# Real-Windows local-CI leg
 
-Two failure classes cannot be reproduced by the container legs and need real
-virtual machines. Both stacks are free. The Windows VM is a first-class part
-of the mandatory local-CI gate (see the repo's local-first workflow): it is
-driven entirely over ssh by reproducible scripts in this directory.
+Windows kernel semantics cannot be reproduced by the container/Wine legs. The
+UTM VM is a first-class part of the mandatory local-CI gate and is driven over
+local ssh by the reproducible scripts in this directory. The canonical macOS
+leg remains the native host; Linux runs through Colima.
 
 ## Windows VM — real ACL/token/owner semantics (script-driven)
 
@@ -21,10 +21,14 @@ seconds-fast local loop with full stderr/debugger visibility.
 | `win.sh`                | on the host | daily driver: build / test / guards / install-E2E / shell |
 
 Host-local config (never committed): `~/.claude/cbm-vm/config` with
-`CBM_VM_HOST=<ip>` and `CBM_VM_USER=<user>`; ssh keypair at
+`CBM_VM_HOST=<ip>`, `CBM_VM_USER=<user>`, and the
+`CBM_VM_HOST_KEY_SHA256=<SHA256:...>` fingerprint printed by the bootstrap.
+`CBM_VM_BRANCH=<branch>` is optional; both drivers otherwise use the current
+local Git branch, falling back to `main` only for a detached worktree.
+The drivers verify that fingerprint before every connection. The ssh keypair is at
 `~/.claude/cbm-vm/id_ed25519` (generate: `ssh-keygen -t ed25519 -N "" -C
-claude-cbm-vm -f ~/.claude/cbm-vm/id_ed25519`, public half goes into
-`windows-bootstrap.ps1`).
+claude-cbm-vm -f ~/.claude/cbm-vm/id_ed25519`; include the public half beside
+`windows-bootstrap.ps1` on the setup ISO as documented in that script).
 
 ### One-time VM creation (~30 min interactive, do it once, snapshot it)
 
@@ -58,13 +62,18 @@ claude-cbm-vm -f ~/.claude/cbm-vm/id_ed25519`, public half goes into
 ### Daily loop
 
 ```
-vm/win.sh update            # sync VM repo to the pushed branch + rebuild
+vm/win.sh update            # sync VM repo to the pushed current branch + rebuild
+vm/win.sh sync              # mirror the uncommitted worktree and rebuild before local gates
 vm/win.sh test cli daemon_ipc         # run suites natively, seconds
 vm/win.sh guards                      # the Windows guard scripts
 vm/win.sh smoke-install               # managed-install E2E, stderr VISIBLE
 vm/win.sh sh "cd /c/cbm && gdb ..."   # anything, interactively
 vm/win.sh push-file src/cli/cli.c /c/cbm/src/cli/cli.c   # WIP iteration
 ```
+
+`sync` requires the VM to already have the exact pushed base commit (`update`
+does that); it then mirrors the host's uncommitted tracked and untracked changes,
+cleans stale build outputs, and rebuilds.
 
 ### Toolchains & honest limits
 
@@ -90,20 +99,6 @@ vm/win.sh push-file src/cli/cli.c /c/cbm/src/cli/cli.c   # WIP iteration
   (`NoDefaultAdminOwner=0`) so CI-only ownership refusals reproduce locally.
 - Environment shape (runner temp paths, runneradmin profile) is
   approximated, not identical — CI on the final SHA remains the proof.
-
-## macOS runner VM (`run.sh mac-vm`) — the GitHub-runner macOS environment
-
-A local Mac is not the GitHub macOS runner (different temp ancestry, ACLs,
-policies): failures like the index-supervisor worker exits reproduce only
-there. Cirrus Labs publishes runner-equivalent images.
-
-1. `brew trust cirruslabs/cli && brew install tart` (free OSS).
-2. `tart clone ghcr.io/cirruslabs/macos-runner:sequoia cbm-mac-runner`
-   (tens of GB, one time).
-
-The leg boots the VM headless (`tart run --no-graphics cbm-mac-runner`),
-syncs the worktree over ssh (admin/admin inside the runner image), and
-executes `scripts/test.sh`.
 
 ## Honesty rules
 
