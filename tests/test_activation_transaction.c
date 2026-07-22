@@ -322,7 +322,10 @@ TEST(activation_transaction_stages_same_directory_private_executable_and_aborts)
     const char *staged = cbm_activation_transaction_staged_path(transaction);
     ASSERT_NOT_NULL(staged);
     ASSERT_TRUE(strncmp(staged, directory, strlen(directory)) == 0);
-    ASSERT_EQ(staged[strlen(directory)], '/');
+    /* The invariant is containment in the target's directory, not a specific
+     * separator: Windows composes the staged path with '\' because the \\?\
+     * namespace performs no forward-slash translation. */
+    ASSERT_TRUE(staged[strlen(directory)] == '/' || staged[strlen(directory)] == '\\');
     ASSERT_FALSE(activation_test_exists(target));
 
     char contents[ACTIVATION_TEST_CONTENT_CAP];

@@ -796,9 +796,13 @@ TEST(version_cohort_crash_releases_process_lifetime_lease) {
         }
         cbm_usleep(1000);
     }
+    /* The turnover acquire gets its own conflict record: acquire zeroes its
+     * conflict_out on entry, so reusing `conflict` here would erase the
+     * probe's VERSION_CONFLICT detail before the assertions read it. */
+    cbm_daemon_conflict_t turnover_conflict;
     cbm_version_cohort_status_t turnover_status =
         manager && terminal
-            ? cbm_version_cohort_acquire(manager, &build_b, UINT64_MAX, &lease, &conflict)
+            ? cbm_version_cohort_acquire(manager, &build_b, UINT64_MAX, &lease, &turnover_conflict)
             : CBM_VERSION_COHORT_IO;
 
     version_cohort_release(&lease);

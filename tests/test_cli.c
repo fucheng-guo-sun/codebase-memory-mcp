@@ -49,6 +49,7 @@ int cbm_cli_checksum_manifest_digest(const char *manifest_path, const char *arch
                                      size_t out_size);
 void cbm_cli_set_activation_cleanup_failure_for_test(bool enabled);
 int cbm_cli_activation_abort_cleanup_probe_for_test(void);
+bool cbm_cli_activation_test_ops_installed(void);
 
 TEST(cli_progress_visibility_policy) {
     ASSERT_TRUE(cbm_cli_progress_enabled(true, false));
@@ -462,6 +463,46 @@ static cbm_cli_activation_ops_t cli_activation_fake_ops(cli_activation_fake_t *f
     return ops;
 }
 
+/* Every install/update/uninstall in this suite dispatches through here. On
+ * Windows a test that has not installed its own activation ops gets a default
+ * fake for the duration of the command: without the seam, the portable-payload
+ * gate (correctly) refuses managed mutations before the shared agent-config
+ * logic these tests verify ever runs. POSIX behavior is untouched — tests
+ * without ops keep exercising the real activation machinery. */
+static cli_activation_fake_t g_cli_test_seam_fake;
+static cbm_cli_activation_ops_t g_cli_test_seam_ops;
+
+static int cli_test_cmd_dispatch(int (*command)(int, char **), int argc, char **argv) {
+#ifdef _WIN32
+    bool engage = !cbm_cli_activation_test_ops_installed();
+#else
+    bool engage = false;
+#endif
+    if (engage) {
+        memset(&g_cli_test_seam_fake, 0, sizeof(g_cli_test_seam_fake));
+        g_cli_test_seam_fake.mutation_reserve_result = 1;
+        g_cli_test_seam_ops = cli_activation_fake_ops(&g_cli_test_seam_fake);
+        cbm_cli_set_activation_ops_for_test(&g_cli_test_seam_ops);
+    }
+    int rc = command(argc, argv);
+    if (engage) {
+        cbm_cli_set_activation_ops_for_test(NULL);
+    }
+    return rc;
+}
+
+static int cli_test_cmd_install(int argc, char **argv) {
+    return cli_test_cmd_dispatch(cbm_cmd_install, argc, argv);
+}
+
+static int cli_test_cmd_uninstall(int argc, char **argv) {
+    return cli_test_cmd_dispatch(cbm_cmd_uninstall, argc, argv);
+}
+
+static int cli_test_cmd_update(int argc, char **argv) {
+    return cli_test_cmd_dispatch(cbm_cmd_update, argc, argv);
+}
+
 static void cli_activation_save_env(char **home_out, char **cache_out) {
     const char *home = getenv("HOME");
     const char *cache = getenv("CBM_CACHE_DIR");
@@ -832,7 +873,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     char dir_arg[640];
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
-    int install_rc = child_ready ? cbm_cmd_install(4, install_argv) : -1;
+    int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
     cbm_cli_set_activation_runtime_parent_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -901,7 +942,7 @@ TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force"};
-    int rc = cbm_cmd_install(1, argv);
+    int rc = cli_test_cmd_install(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
 
     const char *installed = read_test_file(bin_target);
@@ -953,11 +994,11 @@ TEST(cli_install_dir_and_skip_config_stage_first_install_safely) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--skip-config", "--yes", "--dir", install_dir};
-    int rc = cbm_cmd_install(5, argv);
+    int rc = cli_test_cmd_install(5, argv);
     char equals_arg[640];
     snprintf(equals_arg, sizeof(equals_arg), "--dir=%s", install_dir);
     char *dry_argv[] = {"--force", "--skip-config", "--dry-run", equals_arg};
-    int dry_rc = cbm_cmd_install(4, dry_argv);
+    int dry_rc = cli_test_cmd_install(4, dry_argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -994,11 +1035,11 @@ TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
     char *bad_install[] = {"--skip-config=value"};
     char *bad_update[] = {"--not-an-update-option"};
     char *bad_uninstall[] = {"--not-an-uninstall-option"};
-    int missing_rc = cbm_cmd_install(1, missing_dir);
-    int empty_rc = cbm_cmd_install(1, empty_dir);
-    int install_rc = cbm_cmd_install(1, bad_install);
-    int update_rc = cbm_cmd_update(1, bad_update);
-    int uninstall_rc = cbm_cmd_uninstall(1, bad_uninstall);
+    int missing_rc = cli_test_cmd_install(1, missing_dir);
+    int empty_rc = cli_test_cmd_install(1, empty_dir);
+    int install_rc = cli_test_cmd_install(1, bad_install);
+    int update_rc = cli_test_cmd_update(1, bad_update);
+    int uninstall_rc = cli_test_cmd_uninstall(1, bad_uninstall);
     cbm_cli_set_activation_ops_for_test(NULL);
 
     ASSERT_EQ(missing_rc, 1);
@@ -1049,7 +1090,7 @@ TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--reset-indexes", "--yes"};
-    int rc = cbm_cmd_install(3, argv);
+    int rc = cli_test_cmd_install(3, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1114,7 +1155,7 @@ TEST(cli_install_config_only_waits_for_cohort_drain) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     cbm_set_auto_answer_for_test(-1);
-    int rc = cbm_cmd_install(0, NULL);
+    int rc = cli_test_cmd_install(0, NULL);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1180,13 +1221,17 @@ TEST(cli_install_config_and_path_finish_before_guard_release) {
         .mutation_reserve_result = 1,
         .guarded_path_a = codex_config,
         .guarded_text_a = "codebase-memory-mcp",
+#ifndef _WIN32
+        /* Windows configures PATH through the user registry, not a shell rc,
+         * so the rc-file visibility guard is a POSIX-only expectation. */
         .guarded_path_b = shell_rc,
         .guarded_text_b = "export PATH",
+#endif
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     cbm_set_auto_answer_for_test(-1);
-    int rc = cbm_cmd_install(0, NULL);
+    int rc = cli_test_cmd_install(0, NULL);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1251,7 +1296,7 @@ TEST(cli_install_config_failure_keeps_published_binary) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--yes"};
-    int rc = cbm_cmd_install(2, argv);
+    int rc = cli_test_cmd_install(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1302,7 +1347,7 @@ TEST(cli_update_download_failure_does_not_quiesce_sessions) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--standard", "--yes"};
-    int rc = cbm_cmd_update(3, argv);
+    int rc = cli_test_cmd_update(3, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1363,7 +1408,7 @@ TEST(cli_update_already_current_does_not_quiesce_sessions) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--standard"};
-    int rc = fixture_ready ? cbm_cmd_update(1, argv) : -1;
+    int rc = fixture_ready ? cli_test_cmd_update(1, argv) : -1;
     cbm_cli_set_activation_ops_for_test(NULL);
 
     if (old_path) {
@@ -1495,7 +1540,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--standard"};
-    int rc = cbm_cmd_update(2, argv);
+    int rc = cli_test_cmd_update(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
 
     /* Re-run against a known old target while one independently detected agent
@@ -1517,7 +1562,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     };
     cbm_cli_activation_ops_t failure_ops = cli_activation_fake_ops(&config_failure);
     cbm_cli_set_activation_ops_for_test(&failure_ops);
-    int config_failure_rc = cbm_cmd_update(2, argv);
+    int config_failure_rc = cli_test_cmd_update(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     struct stat updated_status;
     bool replacement_kept = stat(bin_target, &updated_status) == 0 &&
@@ -1582,7 +1627,7 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--yes"};
-    int rc = cbm_cmd_uninstall(1, argv);
+    int rc = cli_test_cmd_uninstall(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1642,7 +1687,7 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--yes"};
-    int rc = cbm_cmd_uninstall(1, argv);
+    int rc = cli_test_cmd_uninstall(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1687,10 +1732,10 @@ TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan) {
     char *install_plan[] = {"--force", "--plan"};
     char *update_dry[] = {"--force", "--dry-run", "--standard"};
     char *uninstall_dry[] = {"--dry-run", "--yes"};
-    int install_dry_rc = cbm_cmd_install(2, install_dry);
-    int install_plan_rc = cbm_cmd_install(2, install_plan);
-    int update_dry_rc = cbm_cmd_update(3, update_dry);
-    int uninstall_dry_rc = cbm_cmd_uninstall(2, uninstall_dry);
+    int install_dry_rc = cli_test_cmd_install(2, install_dry);
+    int install_plan_rc = cli_test_cmd_install(2, install_plan);
+    int update_dry_rc = cli_test_cmd_update(3, update_dry);
+    int uninstall_dry_rc = cli_test_cmd_uninstall(2, uninstall_dry);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -2622,7 +2667,7 @@ TEST(cli_openclaw_compaction_preserves_user_owned_section) {
     free(installed);
 
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *uninstalled = read_test_file_alloc(config_path);
     bool preserved_user =
         uninstalled && strstr(uninstalled, "Codebase Memory") && strstr(uninstalled, "User Notes");
@@ -2711,7 +2756,7 @@ TEST(cli_openclaw_uninstall_removes_compaction_when_workspace_is_ambiguous) {
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *after = read_test_file_alloc(config_path);
     bool removed = after && !strstr(after, "Codebase Knowledge Graph (codebase-memory-mcp)");
 
@@ -2822,7 +2867,7 @@ TEST(cli_vscode_profile_mcp_uninstall) {
     cbm_setenv("APPDATA", appdata, 1);
 #endif
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *base = read_test_file_alloc(base_config);
     char *profile = read_test_file_alloc(profile_config);
     bool removed = base && profile && !strstr(base, "codebase-memory-mcp") &&
@@ -3800,7 +3845,7 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--yes"};
-    int rc = cbm_cmd_uninstall(1, argv);
+    int rc = cli_test_cmd_uninstall(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
     char *after = read_test_file_alloc(config_path);
@@ -3836,7 +3881,7 @@ TEST(cli_special_hook_failures_propagate_from_install_and_uninstall) {
     cbm_setenv("PATH", tmpdir, 1);
     int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
     char *args[] = {"-n"};
-    int uninstall_rc = cbm_cmd_uninstall(1, args);
+    int uninstall_rc = cli_test_cmd_uninstall(1, args);
 
     char *after = read_test_file_alloc(hooks_path);
     bool unchanged = after && strcmp(after, "[]\n") == 0;
@@ -5022,7 +5067,7 @@ TEST(cli_cline_data_dir_only_redirects_data_state) {
     free(preserved_hook);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     preserved_hook = read_test_file_alloc(hook_paths[3]);
     bool removed =
         stat(skill, &state) != 0 && preserved_hook && strcmp(preserved_hook, modified_hook) == 0;
@@ -5095,7 +5140,7 @@ TEST(cli_warp_installs_shared_skill_without_mcp_or_permissions) {
     const char *modified = "---\nname: codebase-memory\n---\nUser-owned Warp skill.\n";
     write_test_file(skill_path, modified);
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *preserved = read_test_file_alloc(skill_path);
     bool ownership_safe = preserved && strcmp(preserved, modified) == 0;
     free(preserved);
@@ -5164,7 +5209,7 @@ TEST(cli_owned_durable_profiles_preserve_user_files) {
     write_test_file(copilot_skill, modified_skill);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *codex_after = read_test_file_alloc(codex_agent);
     char *skill_after = read_test_file_alloc(copilot_skill);
     cursor_after = read_test_file_alloc(cursor_agent);
@@ -5253,7 +5298,7 @@ TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall) {
     const char *modified_verify = "name = \"codebase-memory\"\nuser_note = \"preserve verify\"\n";
     write_test_file(verify_path, modified_verify);
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     scout = read_test_file_alloc(scout_path);
     verify = read_test_file_alloc(verify_path);
     struct stat state;
@@ -5323,7 +5368,7 @@ TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets) {
     }
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     struct stat state;
     bool removed = uninstall_rc == 0;
     for (size_t i = 0U; removed && i < 3U; i++) {
@@ -5402,7 +5447,7 @@ TEST(cli_junie_current_durable_context_contract) {
     free(skill_twice);
 
     char *argv[] = {"uninstall", "--yes"};
-    int exact_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int exact_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     bool exact_removed = stat(skill_path, &state) != 0 && stat(agent_path, &state) != 0;
 
     const char *modified_skill = "---\nname: codebase-memory\n---\nUser-owned Junie skill.\n";
@@ -5412,7 +5457,7 @@ TEST(cli_junie_current_durable_context_contract) {
         cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
     write_test_file(skill_path, modified_skill);
     write_test_file(agent_path, modified_agent);
-    int modified_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int modified_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *skill_after = read_test_file_alloc(skill_path);
     char *agent_after = read_test_file_alloc(agent_path);
     bool modified_preserved = skill_after && agent_after &&
@@ -5473,7 +5518,7 @@ TEST(cli_rovo_installs_documented_global_memory) {
     free(second);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *after = read_test_file_alloc(memory_path);
     bool cleaned = uninstall_rc == 0 && after && strcmp(after, personal) == 0;
     free(after);
@@ -5537,7 +5582,7 @@ TEST(cli_hermes_stable_shell_context_contract) {
     free(installed);
 
     char *argv[] = {"uninstall", "--yes"};
-    int exact_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int exact_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *after_exact = read_test_file_alloc(config_path);
     bool exact_removed = after_exact && strstr(after_exact, "theme: solarized") &&
                          strstr(after_exact, "/usr/bin/user-hermes-hook") &&
@@ -5554,7 +5599,7 @@ TEST(cli_hermes_stable_shell_context_contract) {
         write_test_file(config_path, modified);
     }
     free(modified);
-    int modified_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int modified_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *after_modified = read_test_file_alloc(config_path);
     bool modified_preserved = hook_was_modified && after_modified &&
                               strstr(after_modified, "--dialect xermes") &&
@@ -5826,7 +5871,7 @@ TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
     free(qoder_data);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     qoder_data = read_test_file_alloc(qoder_settings);
     qoder_doc = qoder_data ? yyjson_read(qoder_data, strlen(qoder_data), 0) : NULL;
     qoder_root = qoder_doc ? yyjson_doc_get_root(qoder_doc) : NULL;
@@ -6045,7 +6090,7 @@ TEST(cli_registry_installs_kimi_rovo_amp_durable_context) {
     free(amp_skill_twice);
 
     char *argv[] = {"uninstall", "--yes"};
-    int exact_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int exact_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *kimi_after_uninstall = read_test_file_alloc(kimi_instructions);
     char *kimi_config_after_uninstall = read_test_file_alloc(kimi_config);
     char *amp_after_uninstall = read_test_file_alloc(amp_instructions);
@@ -6072,7 +6117,7 @@ TEST(cli_registry_installs_kimi_rovo_amp_durable_context) {
     write_test_file(kimi_skill, modified_kimi_skill);
     write_test_file(rovo_agent, modified_rovo_agent);
     write_test_file(amp_skill, modified_amp_skill);
-    int modified_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int modified_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *kimi_skill_after = read_test_file_alloc(kimi_skill);
     char *rovo_agent_after = read_test_file_alloc(rovo_agent);
     char *amp_skill_after = read_test_file_alloc(amp_skill);
@@ -6243,7 +6288,7 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
     free(devin_agents_data);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     gitlab_data = read_test_file_alloc(gitlab_hooks);
     devin_data = read_test_file_alloc(devin_config);
     devin_agents_data = read_test_file_alloc(devin_agents);
@@ -6330,7 +6375,7 @@ TEST(cli_registry_hook_cleanup_is_independent_from_mcp_ownership) {
     }
 
     char *argv[] = {"uninstall", "--yes"};
-    int foreign_mcp_uninstall = cbm_cmd_uninstall(2, argv);
+    int foreign_mcp_uninstall = cli_test_cmd_uninstall(2, argv);
     bool independent_cleanup = foreign_mcp_uninstall == 0;
     for (size_t i = 0U; i < sizeof(paths) / sizeof(paths[0]); i++) {
         char *data = read_test_file_alloc(paths[i]);
@@ -6370,7 +6415,7 @@ TEST(cli_registry_hook_cleanup_is_independent_from_mcp_ownership) {
         fflush(stdout);
         redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
     }
-    int modified_hook_uninstall = redirected ? cbm_cmd_uninstall(2, argv) : -1;
+    int modified_hook_uninstall = redirected ? cli_test_cmd_uninstall(2, argv) : -1;
     if (redirected) {
         fflush(stdout);
         (void)dup2(saved_stdout, STDOUT_FILENO);
@@ -6615,7 +6660,7 @@ TEST(cli_registry_installs_codebuddy_bob_and_pochi_durable_context) {
         first_rc == 0 && second_rc == 0 && codebuddy_installed && bob_installed && pochi_installed;
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *codebuddy_after = read_test_file_alloc(codebuddy_memory);
     char *bob_after = read_test_file_alloc(bob_rule);
     char *pochi_after = read_test_file_alloc(pochi_rules);
@@ -6820,7 +6865,7 @@ TEST(cli_gemini_installs_dedicated_graph_subagent) {
     free(plan);
 
     char *args[] = {"-n"};
-    int uninstall_rc = cbm_cmd_uninstall(1, args);
+    int uninstall_rc = cli_test_cmd_uninstall(1, args);
     struct stat state;
     bool removed = stat(scout_path, &state) != 0 && stat(agent_path, &state) != 0 &&
                    stat(auditor_path, &state) != 0;
@@ -7254,7 +7299,7 @@ TEST(cli_augment_installs_session_context_and_subagent) {
     free(plan);
 
     char *args[] = {"-n"};
-    int uninstall_rc = cbm_cmd_uninstall(1, args);
+    int uninstall_rc = cli_test_cmd_uninstall(1, args);
     char *settings_after = read_test_file_alloc(settings_path);
     struct stat removed_state;
     bool removed = (!settings_after || (!strstr(settings_after, "codebase-memory-mcp") &&
@@ -7588,7 +7633,7 @@ TEST(cli_uninstall_preserves_hook_script_with_modified_binary) {
     free(installed);
 
     char *args[] = {"-n"};
-    int uninstall_rc = cbm_cmd_uninstall(1, args);
+    int uninstall_rc = cli_test_cmd_uninstall(1, args);
     char *after = read_test_file_alloc(script_path);
     bool preserved = modified && after && strcmp(after, modified) == 0;
     free(after);
@@ -7981,7 +8026,7 @@ TEST(cli_copilot_uninstall_preserves_foreign_named_manifest) {
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("COPILOT_HOME");
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *after = read_test_file_alloc(manifest_path);
     bool preserved = after && strcmp(after, foreign) == 0;
 
@@ -8025,7 +8070,7 @@ TEST(cli_copilot_uninstall_preserves_canonical_shaped_foreign_manifest) {
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("COPILOT_HOME");
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *after = read_test_file_alloc(manifest_path);
     bool preserved = after && strcmp(after, foreign) == 0;
 
@@ -8112,7 +8157,7 @@ TEST(cli_vscode_only_installs_copilot_durable_context) {
     const char *modified = "user-modified-vscode-agent\n";
     write_test_file(agent_path, modified);
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     struct stat removed_hook;
     struct stat removed_skill;
     char *preserved = read_test_file_alloc(agent_path);
@@ -8200,7 +8245,7 @@ TEST(cli_lifecycle_hooks_preserve_foreign_substring_commands) {
     free(factory_after_install);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *qwen_after_uninstall = read_test_file_alloc(qwen_settings);
     char *factory_after_uninstall = read_test_file_alloc(factory_hooks);
     bool qwen_uninstall_preserved = qwen_after_uninstall &&
@@ -9361,7 +9406,7 @@ TEST(cli_uninstall_removes_claude_hook_scripts) {
     cbm_install_agent_configs(tmpdir, binary, false, false);
 
     char *args[] = {"-n"};
-    int rc = cbm_cmd_uninstall(1, args);
+    int rc = cli_test_cmd_uninstall(1, args);
 #ifdef _WIN32
     const char *const names[] = {
         "cbm-code-discovery-gate.cmd",
@@ -9422,7 +9467,7 @@ TEST(cli_uninstall_preserves_modified_claude_hook_script) {
     const char *sentinel = "#!/bin/sh\necho user-modified-session-hook\n";
     write_test_file(modified_path, sentinel);
     char *args[] = {"-n"};
-    (void)cbm_cmd_uninstall(1, args);
+    (void)cli_test_cmd_uninstall(1, args);
     char *after = read_test_file_alloc(modified_path);
     bool preserved = after && strcmp(after, sentinel) == 0;
     free(after);
@@ -10445,7 +10490,7 @@ TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state) {
     }
 
     char *uninstall_argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, uninstall_argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, uninstall_argv);
     char *uninstalled_settings = read_test_file_alloc(settings_path);
     yyjson_doc *uninstalled_doc =
         uninstalled_settings ? yyjson_read(uninstalled_settings, strlen(uninstalled_settings), 0)
@@ -10574,7 +10619,7 @@ TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes) {
                            write_test_file(legacy_path, current_scripts[i]) == 0;
     }
     char *uninstall_argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = uninstall_seeded ? cbm_cmd_uninstall(2, uninstall_argv) : -1;
+    int uninstall_rc = uninstall_seeded ? cli_test_cmd_uninstall(2, uninstall_argv) : -1;
     bool all_owned_shapes_removed = uninstall_rc == 0;
     for (size_t i = 0U; i < sizeof(legacy_names) / sizeof(legacy_names[0]); i++) {
         char current_path[768];
@@ -11554,6 +11599,89 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+#ifdef _WIN32
+/* The fail-closed release contract, asserted with the activation seam OFF:
+ * these calls take the exact dispatch a release binary ships (the portable
+ * body is unreachable), so the gates themselves keep direct unit coverage. */
+TEST(cli_windows_release_gates_refuse_portable_mutations) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-portable-refusal-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+    write_test_file(bin_target, "portable refusal must not touch this");
+
+    /* A one-shot portable payload (this test runner has no launcher context)
+     * may never self-mutate a managed surface. */
+    char *uninstall_argv[] = {"--yes"};
+    int uninstall_rc = cbm_cmd_uninstall(1, uninstall_argv);
+    char *update_argv[] = {"--yes"};
+    int update_rc = cbm_cmd_update(1, update_argv);
+
+    const char *installed = read_test_file(bin_target);
+    bool preserved = installed && strcmp(installed, "portable refusal must not touch this") == 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(uninstall_rc, 1);
+    ASSERT_EQ(update_rc, 1);
+    ASSERT_TRUE(preserved);
+    PASS();
+}
+
+TEST(cli_windows_release_gate_refuses_foreign_install_target) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-foreign-target-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+    write_test_file(bin_target, "foreign binary must be preserved");
+
+    /* An unmanaged file at the canonical launcher path is a conflict the
+     * managed transaction refuses to adopt or replace — even under --force
+     * with prompts auto-answered. */
+    cbm_set_auto_answer_for_test(-1);
+    char *argv[] = {"--force", "-y"};
+    int rc = cbm_cmd_install(2, argv);
+    cbm_set_auto_answer_for_test(0);
+
+    const char *installed = read_test_file(bin_target);
+    bool preserved = installed && strcmp(installed, "foreign binary must be preserved") == 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(preserved);
+    PASS();
+}
+#endif /* _WIN32 */
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
@@ -11591,6 +11719,10 @@ SUITE(cli) {
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
     RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
+#ifdef _WIN32
+    RUN_TEST(cli_windows_release_gates_refuse_portable_mutations);
+    RUN_TEST(cli_windows_release_gate_refuses_foreign_install_target);
+#endif
 
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);

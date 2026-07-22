@@ -85,4 +85,11 @@ const char *cbm_activation_transaction_deferred_path(
 
 const char *cbm_activation_transaction_status_message(cbm_activation_transaction_status_t status);
 
+/* Which security predicate refused the most recent transaction, as
+ * "predicate (os N)", or "" when nothing refused since the last prepare.
+ * The predicates refuse without a usable OS last-error, so this is the only
+ * way a caller can say WHY staging failed. Reset by every prepare/stage
+ * entry; single-threaded like the rest of the transaction API. */
+const char *cbm_activation_transaction_refusal_note(void);
+
 #endif /* CBM_ACTIVATION_TRANSACTION_H */

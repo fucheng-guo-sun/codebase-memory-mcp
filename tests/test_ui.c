@@ -116,19 +116,22 @@ TEST(config_save_atomically_replaces_a_complete_generation) {
         .ui_enabled = true,
         .ui_port = 22222,
     };
-    ASSERT_TRUE(cbm_ui_config_save(&new_generation));
+    /* Capture everything, clean up, and only then assert: an assert firing
+     * before the env restore leaks CBM_CACHE_DIR into every later test in the
+     * process, turning one regression into a cascade. */
+    bool saved = cbm_ui_config_save(&new_generation);
 
     char old_bytes[512] = {0};
 #ifdef _WIN32
     DWORD old_length = 0;
-    ASSERT_TRUE(ReadFile(old_handle, old_bytes, (DWORD)sizeof(old_bytes) - 1U, &old_length, NULL) !=
-                0);
-    ASSERT_GT(old_length, 0);
-    ASSERT_TRUE(CloseHandle(old_handle) != 0);
+    bool old_read = ReadFile(old_handle, old_bytes, (DWORD)sizeof(old_bytes) - 1U, &old_length,
+                             NULL) != 0 &&
+                    old_length > 0;
+    bool old_closed = CloseHandle(old_handle) != 0;
 #else
     size_t old_length = fread(old_bytes, 1, sizeof(old_bytes) - 1, old_handle);
-    ASSERT_GT(old_length, 0);
-    ASSERT_EQ(fclose(old_handle), 0);
+    bool old_read = old_length > 0;
+    bool old_closed = fclose(old_handle) == 0;
 #endif
 
     cbm_ui_config_t loaded = {0};
@@ -142,6 +145,9 @@ TEST(config_save_atomically_replaces_a_complete_generation) {
     free(old_cache);
     (void)th_rmtree(td);
 
+    ASSERT_TRUE(saved);
+    ASSERT_TRUE(old_read);
+    ASSERT_TRUE(old_closed);
     /* An in-place truncate/rewrite mutates the already-open handle. Atomic
      * replacement leaves it attached to the complete prior generation. */
     ASSERT_NOT_NULL(strstr(old_bytes, "11111"));

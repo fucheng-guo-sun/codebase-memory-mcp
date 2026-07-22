@@ -680,8 +680,13 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     if (process->log_file) {
         wchar_t *wlog = cbm_path_to_wide(process->log_file);
         if (wlog) {
-            log = CreateFileW(wlog, GENERIC_WRITE, FILE_SHARE_READ, &security, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
+            /* FILE_SHARE_WRITE keeps POSIX parity: on unix nothing stops a
+             * second producer from appending to the redirected log while the
+             * child holds it (supervision wrappers rely on that), and the
+             * log's owner-only directory is what gates who can. Without it
+             * the child's handle mandatory-locks every other writer out. */
+            log = CreateFileW(wlog, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             free(wlog);
         }
         if (log == INVALID_HANDLE_VALUE) {

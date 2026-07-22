@@ -17,6 +17,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <aclapi.h>
+#include <sddl.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -77,6 +78,37 @@ struct cbm_activation_transaction {
     int directory_fd;
 #endif
 };
+
+/* The transaction's security predicates refuse by returning false without a
+ * usable OS last-error, so every caller used to report the same blind
+ * "status -3, os 0" for five distinct refusal classes (ancestor open,
+ * owner, DACL, target snapshot, staged create). The first predicate that
+ * refuses records what refused here; callers append the note to their error
+ * line. First-wins so the deepest (root) refusal survives the unwind.
+ * Single-threaded by contract: CLI activation runs on one thread. */
+static char g_activation_refusal_note[512];
+
+/* The validated object's path, set by each validator for the duration of its
+ * predicate calls so the note can say WHAT was refused, not just why. Points
+ * into the caller's storage; never dereferenced after the validator returns. */
+static const char *g_activation_refusal_object = NULL;
+
+static void activation_refusal_clear(void) {
+    g_activation_refusal_note[0] = '\0';
+}
+
+static void activation_note_refusal(const char *predicate, unsigned long os_error) {
+    if (g_activation_refusal_note[0] != '\0') {
+        return;
+    }
+    (void)snprintf(g_activation_refusal_note, sizeof(g_activation_refusal_note), "%s (os %lu)%s%s",
+                   predicate, os_error, g_activation_refusal_object ? " at " : "",
+                   g_activation_refusal_object ? g_activation_refusal_object : "");
+}
+
+const char *cbm_activation_transaction_refusal_note(void) {
+    return g_activation_refusal_note;
+}
 
 #ifdef _WIN32
 typedef HANDLE activation_native_file_t;
@@ -382,6 +414,9 @@ static bool activation_windows_owner_is_trusted(HANDLE handle) {
     bool trusted = result == ERROR_SUCCESS && owner && IsValidSid(owner) &&
                    (EqualSid(owner, user_sid) || IsWellKnownSid(owner, WinLocalSystemSid) ||
                     IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
+    if (!trusted) {
+        activation_note_refusal("owner-not-trusted", result);
+    }
     if (descriptor) {
         (void)LocalFree(descriptor);
     }
@@ -400,6 +435,9 @@ static bool activation_windows_owner_is_current(HANDLE handle) {
     DWORD result = GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL,
                                    NULL, NULL, &descriptor);
     bool same = result == ERROR_SUCCESS && owner && IsValidSid(owner) && EqualSid(owner, user_sid);
+    if (!same) {
+        activation_note_refusal("owner-not-current-user", result);
+    }
     if (descriptor) {
         (void)LocalFree(descriptor);
     }
@@ -482,8 +520,20 @@ static bool activation_windows_acl_check(HANDLE handle, DWORD tolerated_untruste
                          * launcher ancestry validators). */
                         IsWellKnownSid(sid, WinCreatorOwnerRightsSid));
         if (!trusted) {
+            char label[128];
+            LPSTR sid_text = NULL;
+            (void)snprintf(label, sizeof(label), "acl-grants-cross-account-mutation to %s",
+                           ConvertSidToStringSidA(sid, &sid_text) && sid_text ? sid_text
+                                                                              : "unparsable-sid");
+            if (sid_text) {
+                (void)LocalFree(sid_text);
+            }
+            activation_note_refusal(label, 0UL);
             secure = false;
         }
+    }
+    if (!secure) {
+        activation_note_refusal("acl-unreadable-or-malformed", result);
     }
     if (descriptor) {
         (void)LocalFree(descriptor);
@@ -560,6 +610,7 @@ static HANDLE activation_windows_directory_open_no_reparse(const char *directory
             CreateFileW(prefixed, FILE_READ_ATTRIBUTES | READ_CONTROL,
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        DWORD open_error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
         prefixed[boundary + 4U] = saved;
         BY_HANDLE_FILE_INFORMATION information;
         bool valid = handle != INVALID_HANDLE_VALUE && GetFileType(handle) == FILE_TYPE_DISK &&
@@ -567,6 +618,10 @@ static HANDLE activation_windows_directory_open_no_reparse(const char *directory
                      (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                      (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
         if (!valid) {
+            activation_note_refusal(handle == INVALID_HANDLE_VALUE
+                                        ? "ancestor-component-open"
+                                        : "ancestor-component-not-plain-directory",
+                                    open_error);
             if (handle != INVALID_HANDLE_VALUE) {
                 (void)CloseHandle(handle);
             }
@@ -592,6 +647,7 @@ static HANDLE activation_windows_directory_open_no_reparse(const char *directory
  * copy's build-fingerprint validation. */
 static bool activation_source_directory_secure(const char *directory,
                                                activation_file_identity_t *identity_out) {
+    g_activation_refusal_object = directory;
     HANDLE handle = activation_windows_directory_open_no_reparse(directory);
     BY_HANDLE_FILE_INFORMATION information;
     bool open_ok = handle != INVALID_HANDLE_VALUE &&
@@ -605,12 +661,14 @@ static bool activation_source_directory_secure(const char *directory,
     if (handle != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(handle);
     }
+    g_activation_refusal_object = NULL;
     return acl_ok;
 }
 
 static bool activation_directory_secure(const char *directory, int *unused,
                                         activation_file_identity_t *identity_out) {
     (void)unused;
+    g_activation_refusal_object = directory;
     HANDLE handle = activation_windows_directory_open_no_reparse(directory);
     BY_HANDLE_FILE_INFORMATION information;
     bool open_ok = handle != INVALID_HANDLE_VALUE &&
@@ -623,6 +681,7 @@ static bool activation_directory_secure(const char *directory, int *unused,
     if (handle != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(handle);
     }
+    g_activation_refusal_object = NULL;
     return acl_ok;
 }
 
@@ -853,6 +912,7 @@ static activation_create_status_t activation_private_file_create(
         free(wide);
         return ACTIVATION_CREATE_ERROR;
     }
+    g_activation_refusal_object = path;
     SetLastError(ERROR_SUCCESS);
     HANDLE file = CreateFileW(wide, GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE,
                               FILE_SHARE_READ, &security.attributes, CREATE_NEW,
@@ -865,6 +925,11 @@ static activation_create_status_t activation_private_file_create(
                  activation_windows_owner_is_current(file) && activation_windows_acl_secure(file);
     activation_windows_security_destroy(&security);
     if (!valid) {
+        if (file == INVALID_HANDLE_VALUE && error != ERROR_FILE_EXISTS &&
+            error != ERROR_ALREADY_EXISTS) {
+            activation_note_refusal("staged-file-create", error);
+        }
+        g_activation_refusal_object = NULL;
         if (file != INVALID_HANDLE_VALUE) {
             (void)CloseHandle(file);
         }
@@ -872,6 +937,7 @@ static activation_create_status_t activation_private_file_create(
                    ? ACTIVATION_CREATE_EXISTS
                    : ACTIVATION_CREATE_ERROR;
     }
+    g_activation_refusal_object = NULL;
     *file_out = file;
     return ACTIVATION_CREATE_OK;
 #else
@@ -1171,6 +1237,7 @@ static cbm_activation_transaction_status_t activation_transaction_prepare(
     const char *target_path, activation_action_t action,
     cbm_activation_transaction_t **transaction_out) {
     *transaction_out = NULL;
+    activation_refusal_clear();
     cbm_activation_transaction_t *transaction = calloc(1, sizeof(*transaction));
     if (!transaction) {
         return CBM_ACTIVATION_TRANSACTION_NO_MEMORY;
@@ -1203,8 +1270,7 @@ static cbm_activation_transaction_status_t activation_transaction_prepare(
     }
     if (!activation_entry_snapshot(transaction, transaction->target_path, transaction->target_name,
                                    &transaction->target_existed, &transaction->target_identity)) {
-#ifdef _WIN32
-#endif
+        activation_note_refusal("target-entry-snapshot", 0UL);
         activation_transaction_destroy(transaction);
         return CBM_ACTIVATION_TRANSACTION_IO;
     }

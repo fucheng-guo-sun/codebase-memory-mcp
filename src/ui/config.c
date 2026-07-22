@@ -187,6 +187,51 @@ static bool config_parent_directory(const char *path, char *directory, size_t di
 #ifdef _WIN32
 static volatile LONG g_config_temp_sequence = 0;
 
+typedef struct {
+    DWORD Flags;
+    HANDLE RootDirectory;
+    DWORD FileNameLength;
+    WCHAR FileName[1];
+} config_file_rename_info_ex_t;
+
+#define CONFIG_FILE_RENAME_INFO_EX_CLASS ((FILE_INFO_BY_HANDLE_CLASS)22)
+#define CONFIG_FILE_RENAME_REPLACE 0x00000001U
+#define CONFIG_FILE_RENAME_POSIX 0x00000002U
+
+/* Publish the still-open temp file over the destination with POSIX rename
+ * semantics: MoveFileExW's legacy replace cannot supersede a destination that
+ * a reader holds open (its name lingers until the last handle closes, even
+ * with FILE_SHARE_DELETE), so a config save racing an open reader failed.
+ * The POSIX form frees the name immediately. The rename target must be the
+ * bare drive path — the NT layer rejects the \\?\ prefix here — and the name
+ * buffer is NUL-terminated in an over-allocated buffer because filter
+ * drivers read FileName as NUL-terminated despite FileNameLength. */
+static bool config_posix_rename_handle(HANDLE file, const wchar_t *target_path) {
+    size_t chars = wcslen(target_path);
+    if (chars >= 4U && wcsncmp(target_path, L"\\\\?\\", 4) == 0) {
+        target_path += 4;
+        chars -= 4U;
+    }
+    if (chars == 0U || chars > (size_t)UINT32_MAX / sizeof(wchar_t)) {
+        return false;
+    }
+    size_t bytes = chars * sizeof(wchar_t);
+    size_t allocation = offsetof(config_file_rename_info_ex_t, FileName) + bytes + sizeof(wchar_t);
+    config_file_rename_info_ex_t *rename = calloc(1U, allocation);
+    if (!rename) {
+        return false;
+    }
+    rename->Flags = CONFIG_FILE_RENAME_POSIX | CONFIG_FILE_RENAME_REPLACE;
+    rename->RootDirectory = NULL;
+    rename->FileNameLength = (DWORD)bytes;
+    memcpy(rename->FileName, target_path, bytes);
+    rename->FileName[chars] = L'\0';
+    bool renamed = SetFileInformationByHandle(file, CONFIG_FILE_RENAME_INFO_EX_CLASS, rename,
+                                              (DWORD)allocation) != 0;
+    free(rename);
+    return renamed;
+}
+
 static bool config_write_atomic(const char *path, const char *json, size_t json_length) {
     wchar_t *wide_path = cbm_path_to_wide(path);
     if (!wide_path) {
@@ -203,7 +248,9 @@ static bool config_write_atomic(const char *path, const char *json, size_t json_
             if (written <= 0 || (size_t)written >= temporary_capacity) {
                 break;
             }
-            file = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+            /* DELETE access on the temp handle is what permits the
+             * rename-by-handle publish below. */
+            file = CreateFileW(temporary, GENERIC_WRITE | DELETE, 0, NULL, CREATE_NEW,
                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
             if (file != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_EXISTS) {
                 break;
@@ -222,13 +269,19 @@ static bool config_write_atomic(const char *path, const char *json, size_t json_
     if (ok) {
         ok = FlushFileBuffers(file) != 0;
     }
+    bool published = ok && config_posix_rename_handle(file, wide_path);
     if (file != INVALID_HANDLE_VALUE && !CloseHandle(file)) {
         ok = false;
     }
-    if (ok) {
-        ok = MoveFileExW(temporary, wide_path,
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (ok && !published) {
+        /* Error-driven fallback, not a version probe: POSIX rename needs
+         * NTFS-class filesystem support, so exFAT/SMB-homed configs land
+         * here, keeping the pre-POSIX behavior (replace can fail while a
+         * reader holds the destination open). */
+        published = MoveFileExW(temporary, wide_path,
+                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
     }
+    ok = ok && published;
     if (!ok && temporary) {
         (void)DeleteFileW(temporary);
     }

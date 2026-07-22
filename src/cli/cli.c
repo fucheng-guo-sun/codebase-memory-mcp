@@ -410,6 +410,10 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops) {
     g_cli_activation_test_ops_set = true;
 }
 
+bool cbm_cli_activation_test_ops_installed(void) {
+    return g_cli_activation_test_ops_set;
+}
+
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent) {
     g_cli_activation_runtime_parent_for_test = runtime_parent;
 }
@@ -1276,7 +1280,7 @@ static int cli_activation_transaction_finalize_close(
     return cli_activation_transaction_abort(transaction_io);
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
 static void cli_activation_transaction_finalize_committed_or_fail_stop(
     cbm_activation_transaction_t **transaction_io, const char *component) {
     if (!transaction_io || !*transaction_io) {
@@ -9346,7 +9350,12 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
 
 /* ── Subcommand: install ──────────────────────────────────────── */
 
-#ifndef _WIN32
+/* The portable activation flow (self-path detection, simple-copy activate)
+ * serves every POSIX build, and Windows TEST builds only: there the C suite
+ * reaches it through the activation test seam to unit-cover the shared
+ * activation/agent-config semantics, while release Windows binaries compile
+ * exclusively the managed launcher transaction. */
+#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
 /* Detect the running binary's path at runtime. Falls back to ~/.local/bin/. */
 static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     buf[0] = '\0';
@@ -9372,7 +9381,7 @@ static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
 #endif
     }
 }
-#endif
+#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
 
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
  * the config / instruction / skill / agent / hook files `install` WOULD write, produced by
@@ -9494,7 +9503,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     return cbm_build_install_plan_json_options(home, binary_path, false);
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
 typedef struct {
     const char *bin_target;
     const char *bin_dir;
@@ -9615,7 +9624,7 @@ static int cli_install_activate(void *opaque) {
                                                                "install_transaction_finalize");
     return CLI_OK;
 }
-#endif
+#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
 
 #ifdef _WIN32
 typedef struct {
@@ -9759,8 +9768,9 @@ static bool cli_windows_stage_private_file(
      * them into one blind "staging failed" with no OS error code. */
     bool ready = status == CBM_ACTIVATION_TRANSACTION_OK && transaction;
     if (!ready) {
-        (void)fprintf(stderr, "error: staging transaction open failed (status %d, os %lu)\n",
-                      (int)status, (unsigned long)GetLastError());
+        const char *refusal = cbm_activation_transaction_refusal_note();
+        (void)fprintf(stderr, "error: staging transaction open failed (status %d, os %lu%s%s)\n",
+                      (int)status, (unsigned long)GetLastError(), refusal[0] ? ": " : "", refusal);
     }
     if (ready && !cli_activation_transaction_expected_build(transaction, &validator)) {
         (void)fprintf(stderr, "error: staged copy build-identity validation failed (os %lu)\n",
@@ -10507,11 +10517,27 @@ int cbm_cmd_install(int argc, char **argv) {
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
 
 #ifdef _WIN32
-    return cli_windows_managed_install(home, requested_bin_dir, dry_run, force, reset_indexes,
-                                       skip_config);
+    /* Fail-closed dispatch polarity: the managed launcher transaction is the
+     * ONLY Windows install path a release binary contains. Test builds
+     * additionally compile the portable flow below, reachable solely through
+     * the activation test seam and loudly announced, so the shared
+     * activation/agent-config semantics stay unit-covered while a misroute
+     * can never pass silently. The real managed transaction has its own
+     * end-to-end gates (launcher guard, agent-config smoke, smoke-install). */
+#ifdef CBM_CLI_ENABLE_TEST_API
+    if (g_cli_activation_test_ops_set) {
+        (void)fprintf(stderr,
+                      "*** cbm test seam: portable install flow engaged; the managed Windows "
+                      "install transaction is bypassed (test builds only) ***\n");
+    } else
+#endif
+    {
+        return cli_windows_managed_install(home, requested_bin_dir, dry_run, force, reset_indexes,
+                                           skip_config);
+    }
 #endif
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
     char self_path[CLI_BUF_1K] = {0};
     cbm_detect_self_path(self_path, sizeof(self_path), home);
 
@@ -10733,7 +10759,7 @@ int cbm_cmd_install(int argc, char **argv) {
         printf("\n(dry-run — no files were modified)\n");
     }
     return 0;
-#endif
+#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
 }
 
 /* ── Subcommand: uninstall ────────────────────────────────────── */
@@ -11834,7 +11860,7 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
     }
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
 typedef struct {
     const char *home;
     const char *bin_path;
@@ -11901,7 +11927,7 @@ static int cli_uninstall_activate(void *opaque) {
     }
     return CLI_OK;
 }
-#endif
+#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
 
 #ifdef _WIN32
 typedef struct {
@@ -12093,9 +12119,17 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 #ifdef _WIN32
     /* A direct/package-manager payload is a one-shot portable instance. Fail
      * before HOME/cache discovery, prompts, daemon IPC, or filesystem writes:
-     * only the permanent launcher may authorize managed removal. */
-    if (!cli_windows_require_managed_mutation(CBM_WINDOWS_LAUNCHER_ACTION_UNINSTALL)) {
-        return CLI_TRUE;
+     * only the permanent launcher may authorize managed removal. Test builds
+     * additionally compile the portable flow below, reachable solely through
+     * the activation test seam (loud), so the shared removal semantics stay
+     * unit-covered; release binaries contain only the managed path. */
+#ifdef CBM_CLI_ENABLE_TEST_API
+    if (!g_cli_activation_test_ops_set)
+#endif
+    {
+        if (!cli_windows_require_managed_mutation(CBM_WINDOWS_LAUNCHER_ACTION_UNINSTALL)) {
+            return CLI_TRUE;
+        }
     }
 #endif
 
@@ -12108,15 +12142,24 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     printf("codebase-memory-mcp uninstall\n\n");
 
 #ifdef _WIN32
-    int windows_result = cli_windows_managed_uninstall(home, dry_run);
-    if (windows_result == CLI_OK) {
-        printf("\nUninstall complete. Please restart your coding-agent "
-               "sessions to properly take this into account.\n");
+#ifdef CBM_CLI_ENABLE_TEST_API
+    if (g_cli_activation_test_ops_set) {
+        (void)fprintf(stderr,
+                      "*** cbm test seam: portable uninstall flow engaged; the managed Windows "
+                      "uninstall transaction is bypassed (test builds only) ***\n");
+    } else
+#endif
+    {
+        int windows_result = cli_windows_managed_uninstall(home, dry_run);
+        if (windows_result == CLI_OK) {
+            printf("\nUninstall complete. Please restart your coding-agent "
+                   "sessions to properly take this into account.\n");
+        }
+        return windows_result == CLI_OK ? CLI_OK : CLI_TRUE;
     }
-    return windows_result == CLI_OK ? CLI_OK : CLI_TRUE;
 #endif
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
     g_agent_uninstall_errors = 0;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
 
@@ -12140,7 +12183,12 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
     char bin_path_storage[CLI_BUF_1K];
     const char *bin_path = bin_path_storage;
+#ifdef _WIN32
+    snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp.exe",
+             home);
+#else
     snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
     struct stat binary_status;
     bool binary_exists = stat(bin_path, &binary_status) == 0;
     cbm_activation_transaction_t *binary_transaction = NULL;
@@ -12183,7 +12231,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         printf("(dry-run — no files were modified)\n");
     }
     return g_agent_uninstall_errors == 0 ? 0 : CLI_TRUE;
-#endif
+#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
 }
 
 /* ── Subcommand: update ───────────────────────────────────────── */
@@ -12923,8 +12971,20 @@ int cbm_cmd_update(int argc, char **argv) {
 
 #ifdef _WIN32
     /* Refuse portable self-update before HOME/cache discovery, the release
-     * version check, network I/O, prompts, or cohort construction. */
-    if (!cli_windows_require_managed_mutation(CBM_WINDOWS_LAUNCHER_ACTION_UPDATE)) {
+     * version check, network I/O, prompts, or cohort construction. In test
+     * builds the activation test seam routes past both managed gates (loud)
+     * so the shared update semantics stay unit-covered; release binaries
+     * always enforce them. */
+    bool update_seam_portable = false;
+#ifdef CBM_CLI_ENABLE_TEST_API
+    update_seam_portable = g_cli_activation_test_ops_set;
+    if (update_seam_portable) {
+        (void)fprintf(stderr, "*** cbm test seam: portable update flow engaged; the managed "
+                              "Windows update gates are bypassed (test builds only) ***\n");
+    }
+#endif
+    if (!update_seam_portable &&
+        !cli_windows_require_managed_mutation(CBM_WINDOWS_LAUNCHER_ACTION_UPDATE)) {
         return CLI_TRUE;
     }
 #endif
@@ -12936,7 +12996,7 @@ int cbm_cmd_update(int argc, char **argv) {
     }
 
 #ifdef _WIN32
-    if (!cli_windows_managed_update_preflight(!dry_run)) {
+    if (!update_seam_portable && !cli_windows_managed_update_preflight(!dry_run)) {
         return CLI_TRUE;
     }
 #endif
